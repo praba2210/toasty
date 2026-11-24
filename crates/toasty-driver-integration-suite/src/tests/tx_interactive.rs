@@ -125,6 +125,113 @@ pub async fn rollback_failure_retries_before_connection_reuse(t: &mut Test) -> R
     Ok(())
 }
 
+/// `commit()` returns `Ok` only when the transaction's writes persist. On
+/// PostgreSQL a failed statement aborts the whole transaction, so the commit
+/// fails; backends that undo only the failed statement commit the first write.
+#[driver_test(requires(sql))]
+pub async fn commit_after_failed_statement_matches_persisted_data(t: &mut Test) -> Result<()> {
+    #[derive(Debug, toasty::Model)]
+    struct Item {
+        #[key]
+        id: i64,
+    }
+
+    let mut db = t.setup_db(models!(Item)).await;
+
+    let mut tx = db.transaction().await?;
+    Item::create().id(1).exec(&mut tx).await?;
+    assert_err!(Item::create().id(1).exec(&mut tx).await);
+    let committed = tx.commit().await;
+
+    let items = Item::all().exec(&mut db).await?;
+    match committed {
+        Ok(()) => assert_eq!(items.len(), 1),
+        Err(err) => {
+            assert!(err.is_driver_operation_failed());
+            assert!(items.is_empty());
+        }
+    }
+
+    Ok(())
+}
+
+/// Rolling back a nested transaction undoes a failed statement inside it, so
+/// the outer transaction still commits.
+#[driver_test(requires(sql))]
+pub async fn nested_rollback_after_failed_statement_keeps_outer_commit(t: &mut Test) -> Result<()> {
+    #[derive(Debug, toasty::Model)]
+    struct Item {
+        #[key]
+        id: i64,
+    }
+
+    let mut db = t.setup_db(models!(Item)).await;
+
+    let mut tx = db.transaction().await?;
+    Item::create().id(1).exec(&mut tx).await?;
+
+    {
+        let mut nested = tx.transaction().await?;
+        assert_err!(Item::create().id(1).exec(&mut nested).await);
+        nested.rollback().await?;
+    }
+
+    tx.commit().await?;
+
+    let items = Item::all().exec(&mut db).await?;
+    assert_eq!(items.len(), 1);
+
+    Ok(())
+}
+
+/// A multi-statement plan that fails inside a transaction is rolled back to
+/// the engine's savepoint, so the transaction still commits its earlier write.
+#[driver_test(requires(sql))]
+pub async fn failed_multi_op_plan_keeps_outer_commit(t: &mut Test) -> Result<()> {
+    #[derive(Debug, toasty::Model)]
+    struct Parent {
+        #[key]
+        id: i64,
+
+        #[has_many]
+        children: toasty::Deferred<Vec<Child>>,
+    }
+
+    #[derive(Debug, toasty::Model)]
+    struct Child {
+        #[key]
+        id: i64,
+
+        #[index]
+        parent_id: i64,
+
+        #[belongs_to(key = parent_id, references = id)]
+        parent: toasty::Deferred<Parent>,
+    }
+
+    let mut db = t.setup_db(models!(Parent, Child)).await;
+
+    let mut tx = db.transaction().await?;
+    Parent::create().id(1).exec(&mut tx).await?;
+    Child::create().id(1).parent_id(1).exec(&mut tx).await?;
+    // Inserts parent 2, then fails on the duplicate child id.
+    assert_err!(
+        Parent::create()
+            .id(2)
+            .children([Child::create().id(1)])
+            .exec(&mut tx)
+            .await
+    );
+    tx.commit().await?;
+
+    let parents = Parent::all().exec(&mut db).await?;
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0].id, 1);
+    assert_eq!(Child::all().exec(&mut db).await?.len(), 1);
+
+    Ok(())
+}
+
 /// Cancelling a queued commit keeps the connection reusable.
 #[driver_test(requires(sql))]
 pub async fn cancel_queued_commit_keeps_connection_reusable(t: &mut Test) -> Result<()> {

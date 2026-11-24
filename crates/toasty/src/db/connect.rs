@@ -152,6 +152,10 @@ impl Driver for Connect {
         self.driver.generate_migration(schema_diff)
     }
 
+    fn validate_migration(&self, schema_diff: &diff::Schema<'_>) -> Result<()> {
+        self.driver.validate_migration(schema_diff)
+    }
+
     async fn reset_db(&self) -> Result<()> {
         self.driver.reset_db().await
     }

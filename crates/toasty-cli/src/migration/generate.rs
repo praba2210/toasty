@@ -257,7 +257,7 @@ impl GenerateCommand {
 
         let rename_hints = collect_rename_hints(&previous_schema, &schema)?;
         let Some(generated) =
-            migration::generate(db.driver(), &previous_schema, &schema, &rename_hints)
+            migration::generate(db.driver(), &previous_schema, &schema, &rename_hints)?
         else {
             println!(
                 "  {}",

@@ -1,4 +1,4 @@
-use super::{ColumnDef, Statement};
+use super::{ColumnDef, DdlOptions, Statement};
 
 use toasty_core::{
     driver::Capability,
@@ -38,6 +38,14 @@ impl Statement {
             ))),
         }
         .into()
+    }
+
+    /// Creates a `CREATE TABLE` statement rendered with driver [`DdlOptions`].
+    pub fn create_table_with(table: &Table, capability: &Capability, options: &DdlOptions) -> Self {
+        if options.identity_cache.is_some() {
+            todo!("F4: render identity columns with (CACHE n)")
+        }
+        Self::create_table(table, capability)
     }
 }
 

@@ -282,6 +282,17 @@ pub struct Capability {
     /// transaction.
     pub interactive_transactions: bool,
 
+    /// Whether the backend supports `SAVEPOINT` inside a transaction.
+    ///
+    /// When `false`, nested transactions are rejected with
+    /// [`Error::unsupported_feature`](crate::Error::unsupported_feature) and a
+    /// multi-statement plan inside a user transaction runs its steps directly
+    /// in that transaction instead of under a savepoint.
+    ///
+    /// - SQLite / Turso / PostgreSQL / MySQL / MariaDB: `true`.
+    /// - Aurora DSQL / DynamoDB: `false`.
+    pub savepoints: bool,
+
     /// Whether the backend can walk a paginated query in reverse from a
     /// cursor.
     ///
@@ -741,6 +752,7 @@ impl Capability {
         // lock-acquisition policy.
         transaction_lock_mode: true,
         interactive_transactions: true,
+        savepoints: true,
 
         backward_pagination: true,
         sql_nulls_first_on_asc: true,
@@ -848,6 +860,40 @@ impl Capability {
         vec_remove_at: true,
 
         ..Self::SQLITE
+    };
+
+    /// Amazon Aurora DSQL capabilities, selected by the PostgreSQL driver's
+    /// `aurora_dsql()` option.
+    ///
+    /// DSQL speaks the PostgreSQL protocol but has no `CREATE TYPE`, no array
+    /// columns, no savepoints, and no in-place column type changes.
+    pub const AURORA_DSQL: Self = Self {
+        driver_name: "Aurora DSQL",
+        storage_types: StorageTypes::AURORA_DSQL,
+        schema_mutations: SchemaMutations {
+            alter_column_type: false,
+            alter_column_properties_atomic: false,
+        },
+
+        // No `CREATE TYPE`: enums are stored as TEXT with a CHECK constraint.
+        native_enum: false,
+        named_enum_types: false,
+
+        // Bare NUMERIC is numeric(18,6) and rounds to scale 6; decimals need
+        // explicit precision.
+        decimal_arbitrary_precision: false,
+
+        // No array column types, so no `Vec<scalar>` fields.
+        native_array: false,
+        vec_scalar: false,
+        unique_list_index: false,
+        vec_remove: false,
+        vec_pop: false,
+        vec_remove_at: false,
+
+        savepoints: false,
+
+        ..Self::POSTGRESQL
     };
 
     /// MySQL capabilities
@@ -1007,6 +1053,7 @@ impl Capability {
         // DynamoDB rejects `Operation::Transaction` wholesale.
         transaction_lock_mode: false,
         interactive_transactions: false,
+        savepoints: false,
 
         backward_pagination: false,
         sql_nulls_first_on_asc: false,
@@ -1123,6 +1170,18 @@ impl StorageTypes {
         // to i64::MAX. While NUMERIC could theoretically support larger values,
         // we prefer explicit limits over implicit type switching.
         max_unsigned_integer: Some(i64::MAX as u64),
+    };
+
+    /// Amazon Aurora DSQL storage types.
+    pub const AURORA_DSQL: StorageTypes = StorageTypes {
+        // DSQL caps `VARCHAR(n)` at 65,535.
+        varchar: Some(65_535),
+
+        // Bare NUMERIC is `numeric(18,6)` on DSQL. `rust_decimal::Decimal`
+        // has up to 29 integer digits and a scale of up to 28.
+        default_decimal_type: db::Type::Numeric(Some((57, 28))),
+
+        ..StorageTypes::POSTGRESQL
     };
 
     /// MySQL storage types.
@@ -1243,6 +1302,11 @@ mod tests {
     fn test_validate_postgresql_capability() {
         // PostgreSQL has native_varchar=true and varchar=Some, should pass
         assert!(Capability::POSTGRESQL.validate().is_ok());
+    }
+
+    #[test]
+    fn test_validate_aurora_dsql_capability() {
+        assert!(Capability::AURORA_DSQL.validate().is_ok());
     }
 
     #[test]

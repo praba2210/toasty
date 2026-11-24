@@ -4,6 +4,7 @@ mod connection;
 mod connection_task;
 mod executor;
 mod pool;
+mod retry;
 mod tx;
 
 pub use builder::Builder;
@@ -11,6 +12,7 @@ pub use connect::Connect;
 pub use connection::Connection;
 pub use executor::Executor;
 pub use pool::{Pool, PoolStatus};
+pub use retry::RetryPolicy;
 pub use toasty_core::driver::{Capability, ConnectContext, Dialect, Driver, SqlPlaceholder};
 pub use tx::{Transaction, TransactionBuilder};
 
@@ -31,6 +33,7 @@ use std::sync::Arc;
 pub(crate) struct Shared {
     pub(crate) engine: Engine,
     pub(crate) pool: Pool,
+    pub(crate) occ_retry: Option<RetryPolicy>,
 }
 
 /// A database handle backed by a connection pool.
@@ -149,6 +152,29 @@ impl Db {
     /// the `Db` beforehand if you need a separate handle.
     pub fn transaction_builder(&mut self) -> TransactionBuilder<'_> {
         TransactionBuilder::new(tx::TxSource::Db(self))
+    }
+
+    /// Runs `f` in a transaction and commits it, re-running the whole
+    /// transaction when it fails with an optimistic-concurrency conflict.
+    ///
+    /// When `f` or the commit fails with
+    /// [`Error::is_serialization_failure`](crate::Error::is_serialization_failure),
+    /// the transaction is rolled back and `f` runs again in a new one, up to
+    /// the [`RetryPolicy`] set with [`Builder::occ_retry`] (or
+    /// [`RetryPolicy::default`] when none is set). Any other error rolls back
+    /// and is returned without a retry. `f` may run more than once, so it
+    /// should have no side effects outside the database.
+    ///
+    /// `f` returns [`Result<T>`](crate::Result), like the code run inside
+    /// [`transaction`](Self::transaction). Where the returned future must be
+    /// `Send` (for example in `tokio::spawn` or an axum handler), `f` must be
+    /// an `async move` closure that owns what it captures.
+    pub async fn transaction_with_retry<T, F>(&mut self, f: F) -> Result<T>
+    where
+        F: AsyncFnMut(&mut Transaction<'_>) -> Result<T>,
+    {
+        let _ = f;
+        todo!("F10: begin, run f, commit; retry the whole transaction on serialization failure")
     }
 
     /// Returns a reference to the connection pool backing this handle.

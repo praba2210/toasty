@@ -28,6 +28,9 @@ pub use create_table::CreateTable;
 mod create_type;
 pub use create_type::CreateType;
 
+mod ddl_options;
+pub use ddl_options::DdlOptions;
+
 mod drop_column;
 pub use drop_column::DropColumn;
 

@@ -180,6 +180,10 @@ impl Driver for InstrumentedDriver {
         self.inner.generate_migration(schema_diff)
     }
 
+    fn validate_migration(&self, schema_diff: &diff::Schema<'_>) -> Result<()> {
+        self.inner.validate_migration(schema_diff)
+    }
+
     async fn reset_db(&self) -> Result<()> {
         self.inner.reset_db().await
     }

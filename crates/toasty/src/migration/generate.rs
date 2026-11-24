@@ -1,4 +1,5 @@
 use crate::{
+    Result,
     db::Driver,
     schema::{db, diff},
 };
@@ -21,22 +22,25 @@ pub struct Generated {
 
 /// Generate a database migration from `previous` to `next`.
 ///
-/// Returns `None` when the schemas are equivalent after applying
-/// `rename_hints`.
+/// Returns `Ok(None)` when the schemas are equivalent after applying
+/// `rename_hints`, and an error when the driver cannot apply the change (see
+/// [`Driver::validate_migration`]).
 pub fn generate(
     driver: &dyn Driver,
     previous: &db::Schema,
     next: &db::Schema,
     rename_hints: &diff::RenameHints,
-) -> Option<Generated> {
+) -> Result<Option<Generated>> {
     let schema_diff = diff::Schema::from(previous, next, rename_hints);
 
     if schema_diff.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(Generated {
+    driver.validate_migration(&schema_diff)?;
+
+    Ok(Some(Generated {
         migration: driver.generate_migration(&schema_diff),
         snapshot: Snapshot::new(next.clone()),
-    })
+    }))
 }

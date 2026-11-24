@@ -67,6 +67,9 @@ impl Connection {
         stmt: stmt::Statement,
         in_transaction: bool,
     ) -> crate::Result<ExecResponse> {
+        if !in_transaction && self.shared.occ_retry.is_some() {
+            todo!("F10: re-plan and re-run on serialization failure, per the policy")
+        }
         // Created on the caller's task so the span parents to the caller's
         // current span; the worker task enters it while executing.
         let span = crate::instrument::query_span(&self.shared.engine.schema, &stmt);
@@ -140,6 +143,21 @@ impl Connection {
     /// `Connection` stays locked for the lifetime of the transaction.
     pub fn transaction_builder(&mut self) -> super::TransactionBuilder<'_> {
         super::TransactionBuilder::new(super::tx::TxSource::Connection(self))
+    }
+
+    /// Runs `f` in a transaction on this connection and commits it, re-running
+    /// the whole transaction when it fails with an optimistic-concurrency
+    /// conflict. See [`Db::transaction_with_retry`](super::Db::transaction_with_retry).
+    ///
+    /// `f` returns [`crate::Result<T>`]. Where the returned future must be
+    /// `Send` (for example in `tokio::spawn` or an axum handler), `f` must be
+    /// an `async move` closure that owns what it captures.
+    pub async fn transaction_with_retry<T, F>(&mut self, f: F) -> crate::Result<T>
+    where
+        F: AsyncFnMut(&mut super::Transaction<'_>) -> crate::Result<T>,
+    {
+        let _ = f;
+        todo!("F10: begin, run f, commit; retry the whole transaction on serialization failure")
     }
 
     /// Creates tables and indices defined in the schema on the database.

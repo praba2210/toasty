@@ -8,7 +8,9 @@ use toasty_core::{
     },
 };
 
-use crate::stmt::{AlterColumnChanges, AlterTable, AlterTableAction, DropTable, Name, Statement};
+use crate::stmt::{
+    AlterColumnChanges, AlterTable, AlterTableAction, DdlOptions, DropTable, Name, Statement,
+};
 
 /// Returns `true` if a named enum change is handled at the type level and
 /// should not produce column-level DDL.
@@ -71,6 +73,23 @@ impl<'a> MigrationStatement<'a> {
     /// `ALTER COLUMN` support (e.g. SQLite), column type changes trigger a
     /// full table recreation sequence.
     pub fn from_diff(schema_diff: &'a diff::Schema<'a>, capability: &Capability) -> Vec<Self> {
+        Self::from_diff_with(schema_diff, capability, &DdlOptions::default())
+    }
+
+    /// Generates migration statements from a [`diff::Schema`], rendering DDL
+    /// with driver [`DdlOptions`].
+    pub fn from_diff_with(
+        schema_diff: &'a diff::Schema<'a>,
+        capability: &Capability,
+        options: &DdlOptions,
+    ) -> Vec<Self> {
+        if *options != DdlOptions::default() {
+            todo!(
+                "F3/F4: thread DdlOptions into CREATE TABLE, CREATE INDEX, ADD COLUMN and \
+                 ALTER COLUMN ADD GENERATED (CACHE n)"
+            )
+        }
+
         let mut result = Vec::new();
         let types_diff = schema_diff.types();
         let renamed_types: HashSet<(&str, &str)> = types_diff

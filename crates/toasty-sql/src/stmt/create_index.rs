@@ -1,4 +1,4 @@
-use super::Statement;
+use super::{DdlOptions, Statement};
 
 use toasty_core::{
     schema::db::{Index, IndexId, IndexOp, TableId},
@@ -41,6 +41,14 @@ impl Statement {
             unique: index.unique,
         }
         .into()
+    }
+
+    /// Creates a `CREATE INDEX` statement rendered with driver [`DdlOptions`].
+    pub fn create_index_with(index: &Index, options: &DdlOptions) -> Self {
+        if options.async_index {
+            todo!("F3: render CREATE [UNIQUE] INDEX ASYNC")
+        }
+        Self::create_index(index)
     }
 }
 

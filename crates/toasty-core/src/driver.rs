@@ -146,6 +146,19 @@ pub trait Driver: Debug + Send + Sync + 'static {
     /// Generates a migration from a [`diff::Schema`].
     fn generate_migration(&self, schema_diff: &diff::Schema<'_>) -> Migration;
 
+    /// Checks that the backend can apply a [`diff::Schema`] before any
+    /// migration is generated, written, or run.
+    ///
+    /// Drivers whose backend cannot apply some schema changes (for example,
+    /// Aurora DSQL cannot change a column's type) return
+    /// [`crate::Error::unsupported_feature`] naming the change. The default
+    /// accepts every diff. Drivers that wrap another driver must forward this
+    /// call to it.
+    fn validate_migration(&self, schema_diff: &diff::Schema<'_>) -> crate::Result<()> {
+        let _ = schema_diff;
+        Ok(())
+    }
+
     /// Drops the entire database and recreates an empty one without applying migrations.
     ///
     /// Used primarily in tests to start with a clean slate.

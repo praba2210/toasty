@@ -1,7 +1,11 @@
 #![cfg(feature = "migration")]
 
+use async_trait::async_trait;
+use std::borrow::Cow;
+use toasty::Result;
 use toasty::migration;
 use toasty::schema::{db, diff};
+use toasty_core::driver::{Capability, ConnectContext, Connection, Driver};
 use toasty_core::stmt;
 use toasty_driver_sqlite::Sqlite;
 
@@ -55,7 +59,7 @@ fn generate_returns_none_for_empty_diff() {
     let hints = diff::RenameHints::new();
     let driver = Sqlite::in_memory();
 
-    let generated = migration::generate(&driver, &schema, &schema, &hints);
+    let generated = migration::generate(&driver, &schema, &schema, &hints).unwrap();
 
     assert!(generated.is_none());
 }
@@ -67,12 +71,58 @@ fn generate_returns_migration_and_next_snapshot() {
     let hints = diff::RenameHints::new();
     let driver = Sqlite::in_memory();
 
-    let generated = migration::generate(&driver, &previous, &next, &hints).unwrap();
+    let generated = migration::generate(&driver, &previous, &next, &hints)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(generated.snapshot.schema.tables[0].name, "users");
     let db::Migration::Sql(sql) = generated.migration;
     assert!(sql.contains("CREATE TABLE"));
     assert!(sql.contains("users"));
+}
+
+/// Wraps SQLite but rejects every migration, like a backend that cannot apply
+/// the change.
+#[derive(Debug)]
+struct RejectingDriver(Sqlite);
+
+#[async_trait]
+impl Driver for RejectingDriver {
+    fn url(&self) -> Cow<'_, str> {
+        self.0.url()
+    }
+
+    fn capability(&self) -> &'static Capability {
+        self.0.capability()
+    }
+
+    async fn connect(&self, cx: &ConnectContext) -> Result<Box<dyn Connection>> {
+        self.0.connect(cx).await
+    }
+
+    fn generate_migration(&self, _schema_diff: &diff::Schema<'_>) -> db::Migration {
+        panic!("generate_migration must not run after validation fails")
+    }
+
+    fn validate_migration(&self, _schema_diff: &diff::Schema<'_>) -> Result<()> {
+        Err(toasty::Error::unsupported_feature("change not supported"))
+    }
+
+    async fn reset_db(&self) -> Result<()> {
+        self.0.reset_db().await
+    }
+}
+
+#[test]
+fn generate_returns_driver_validation_error() {
+    let previous = db::Schema::default();
+    let next = users_schema();
+    let hints = diff::RenameHints::new();
+    let driver = RejectingDriver(Sqlite::in_memory());
+
+    let err = migration::generate(&driver, &previous, &next, &hints).unwrap_err();
+
+    assert!(err.is_unsupported_feature());
 }
 
 #[test]

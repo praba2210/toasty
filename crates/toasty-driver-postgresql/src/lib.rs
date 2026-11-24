@@ -21,7 +21,7 @@ mod value;
 pub(crate) use value::Value;
 
 use async_trait::async_trait;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Duration};
 use toasty_core::{
     Result, Schema,
     driver::{
@@ -83,6 +83,42 @@ pub struct PostgreSQL {
     config: Config,
     #[cfg(feature = "tls")]
     tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
+    capability: &'static Capability,
+    dsql: Option<DsqlSchemaConfig>,
+    password_provider: Option<PasswordProvider>,
+}
+
+type PasswordFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<String, BoxError>> + Send + 'static>>;
+type PasswordProvider = Arc<dyn Fn() -> PasswordFuture + Send + Sync>;
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Schema-execution settings for Aurora DSQL, read only by this driver.
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // Read by the F3/F4/F7 implementation.
+struct DsqlSchemaConfig {
+    /// `CACHE` value for identity columns: 1 or at least 65,536.
+    identity_cache: u32,
+
+    /// How long to wait for an asynchronous index-build job.
+    job_timeout: Duration,
+
+    /// Retries for a schema step the server rejects with SQLSTATE `40001`.
+    schema_retries: u32,
+    schema_retry_base_delay: Duration,
+    schema_retry_max_delay: Duration,
+}
+
+impl Default for DsqlSchemaConfig {
+    fn default() -> Self {
+        Self {
+            identity_cache: 65_536,
+            job_timeout: Duration::from_secs(5 * 60),
+            schema_retries: 3,
+            schema_retry_base_delay: Duration::from_millis(50),
+            schema_retry_max_delay: Duration::from_secs(5),
+        }
+    }
 }
 
 impl std::fmt::Debug for PostgreSQL {
@@ -92,12 +128,21 @@ impl std::fmt::Debug for PostgreSQL {
             config,
             #[cfg(feature = "tls")]
             tls,
+            capability,
+            dsql,
+            password_provider,
         } = self;
         let mut s = f.debug_struct("PostgreSQL");
         s.field("url", url);
         s.field("config", config);
         #[cfg(feature = "tls")]
         s.field("tls", &tls.as_ref().map(|_| "MakeRustlsConnect"));
+        s.field("capability", &capability.driver_name);
+        s.field("dsql", dsql);
+        s.field(
+            "password_provider",
+            &password_provider.as_ref().map(|_| "PasswordProvider"),
+        );
         s.finish()
     }
 }
@@ -216,10 +261,111 @@ impl PostgreSQL {
             config,
             #[cfg(feature = "tls")]
             tls,
+            capability: &Capability::POSTGRESQL,
+            dsql: None,
+            password_provider: None,
+        })
+    }
+
+    /// Targets Amazon Aurora DSQL.
+    ///
+    /// Selects [`Capability::AURORA_DSQL`] and DSQL's schema rules:
+    /// `push_schema` and migrations run one DDL statement per transaction,
+    /// build indexes with `CREATE INDEX ASYNC` and wait for the build job,
+    /// render identity columns with `CACHE 65536`, and retry a schema step
+    /// the server rejects with SQLSTATE `40001`. Transactions run at
+    /// `REPEATABLE READ` whatever isolation level is requested, with a
+    /// warning when it differs.
+    ///
+    /// Without this call the driver behaves as plain PostgreSQL; the host
+    /// name is never inspected.
+    pub fn aurora_dsql(mut self) -> Self {
+        self.capability = &Capability::AURORA_DSQL;
+        self.dsql.get_or_insert_with(DsqlSchemaConfig::default);
+        self
+    }
+
+    /// Sets the `CACHE` value for identity (auto-increment) columns on
+    /// Aurora DSQL. The default is 65,536.
+    ///
+    /// DSQL accepts 1 or at least 65,536. A large cache gives unique but
+    /// non-consecutive ids across connections; 1 gives dense ids at lower
+    /// insert throughput.
+    ///
+    /// Returns [`Error::invalid_driver_configuration`] for any other value,
+    /// or when [`aurora_dsql`](Self::aurora_dsql) was not called first.
+    ///
+    /// [`Error::invalid_driver_configuration`]: toasty_core::Error::invalid_driver_configuration
+    pub fn identity_cache(mut self, cache: u32) -> Result<Self> {
+        let dsql = self.dsql_config_mut("identity_cache")?;
+        if cache != 1 && cache < 65_536 {
+            return Err(toasty_core::Error::invalid_driver_configuration(format!(
+                "Aurora DSQL identity cache must be 1 or at least 65536, got {cache}"
+            )));
+        }
+        dsql.identity_cache = cache;
+        Ok(self)
+    }
+
+    /// Sets how long `push_schema` and migrations wait for an Aurora DSQL
+    /// index-build job. The default is 5 minutes.
+    ///
+    /// When the wait times out, the operation fails and the job keeps running
+    /// on the server.
+    ///
+    /// Returns [`Error::invalid_driver_configuration`] when
+    /// [`aurora_dsql`](Self::aurora_dsql) was not called first, or when
+    /// `timeout` is zero.
+    ///
+    /// [`Error::invalid_driver_configuration`]: toasty_core::Error::invalid_driver_configuration
+    pub fn schema_job_timeout(mut self, timeout: Duration) -> Result<Self> {
+        let dsql = self.dsql_config_mut("schema_job_timeout")?;
+        if timeout.is_zero() {
+            return Err(toasty_core::Error::invalid_driver_configuration(
+                "Aurora DSQL schema job timeout must be greater than zero",
+            ));
+        }
+        dsql.job_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Sets a function that returns the password for each new connection.
+    ///
+    /// The provider runs once per connection the driver opens: when the pool
+    /// grows or replaces a connection, and for every `reset_db` and CLI
+    /// connection. It does not run when a pooled connection is reused. Its
+    /// result overrides any password in the connection URL. Use it for
+    /// short-lived credentials such as Aurora DSQL IAM authentication tokens.
+    ///
+    /// When the provider fails, connecting fails with
+    /// `driver_operation_failed("PostgreSQL password provider failed")`; the
+    /// provider's own error text is not included because it may contain
+    /// secrets.
+    pub fn password_provider<F, Fut, E>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<String, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.password_provider = Some(Arc::new(move || {
+            let fut = provider();
+            Box::pin(async move { fut.await.map_err(Into::into) })
+        }));
+        self
+    }
+
+    fn dsql_config_mut(&mut self, option: &str) -> Result<&mut DsqlSchemaConfig> {
+        self.dsql.as_mut().ok_or_else(|| {
+            toasty_core::Error::invalid_driver_configuration(format!(
+                "`{option}` requires `aurora_dsql()` to be called first"
+            ))
         })
     }
 
     async fn connect_with_config(&self, config: Config) -> Result<Connection> {
+        if self.password_provider.is_some() {
+            todo!("F2: call the password provider and set the password on the config")
+        }
         #[cfg(feature = "tls")]
         if let Some(ref tls) = self.tls {
             return Connection::connect(config, tls.clone()).await;
@@ -235,7 +381,7 @@ impl Driver for PostgreSQL {
     }
 
     fn capability(&self) -> &'static Capability {
-        &Capability::POSTGRESQL
+        self.capability
     }
 
     async fn connect(
@@ -244,10 +390,21 @@ impl Driver for PostgreSQL {
     ) -> toasty_core::Result<Box<dyn toasty_core::driver::Connection>> {
         let mut connection = self.connect_with_config(self.config.clone()).await?;
         connection.query_log = cx.query_log;
+        connection.dsql = self.dsql.clone();
         Ok(Box::new(connection))
     }
 
+    fn validate_migration(&self, _schema_diff: &diff::Schema<'_>) -> Result<()> {
+        if self.dsql.is_some() {
+            todo!("F4/F6: reject schema changes Aurora DSQL cannot apply")
+        }
+        Ok(())
+    }
+
     fn generate_migration(&self, schema_diff: &diff::Schema<'_>) -> Migration {
+        if self.dsql.is_some() {
+            todo!("F6: one statement per breakpoint, rendered with DdlOptions")
+        }
         let statements = sql::MigrationStatement::from_diff(schema_diff, &Capability::POSTGRESQL);
 
         let sql_strings: Vec<String> = statements
@@ -259,6 +416,9 @@ impl Driver for PostgreSQL {
     }
 
     async fn reset_db(&self) -> toasty_core::Result<()> {
+        if self.dsql.is_some() {
+            todo!("F11: drop every table in the current schema")
+        }
         let dbname = self
             .config
             .get_dbname()
@@ -327,6 +487,7 @@ pub struct Connection {
     statement_cache: StatementCache,
     oid_cache: OidCache,
     query_log: QueryLogConfig,
+    dsql: Option<DsqlSchemaConfig>,
 }
 
 impl Connection {
@@ -337,6 +498,7 @@ impl Connection {
             statement_cache: StatementCache::new(100),
             oid_cache: OidCache::new(),
             query_log: QueryLogConfig::default(),
+            dsql: None,
         }
     }
 
@@ -505,6 +667,13 @@ impl toasty_core::driver::Connection for Connection {
                     "PostgreSQL does not support TransactionMode::{mode:?}"
                 )));
             }
+            if let Transaction::Start {
+                isolation: Some(_), ..
+            } = t
+                && self.dsql.is_some()
+            {
+                todo!("F9: plain BEGIN, warn when the level is not REPEATABLE READ")
+            }
             let sql = sql::Serializer::postgresql(&schema.db).serialize_transaction(t);
             self.client
                 .batch_execute(&sql)
@@ -541,6 +710,9 @@ impl toasty_core::driver::Connection for Connection {
     }
 
     async fn push_schema(&mut self, schema: &Schema) -> Result<()> {
+        if self.dsql.is_some() {
+            todo!("F3/F4/F5: one DDL per statement, ASYNC indexes and job waits")
+        }
         let serializer = sql::Serializer::postgresql(&schema.db);
 
         // Create PostgreSQL enum types before creating tables.
@@ -611,6 +783,9 @@ impl toasty_core::driver::Connection for Connection {
         migration: &toasty_core::schema::db::Migration,
     ) -> Result<()> {
         tracing::info!(id = id, name = %name, "applying migration");
+        if self.dsql.is_some() {
+            todo!("F7: one statement per transaction, job waits, schema-step retry")
+        }
         // Ensure the migrations table exists
         self.client
             .execute(
@@ -776,5 +951,40 @@ mod tests {
             err.to_string().contains("invalid port"),
             "expected invalid-port error, got: {err}"
         );
+    }
+
+    #[test]
+    fn aurora_dsql_selects_dsql_capability() {
+        let pg = PostgreSQL::new("postgresql://localhost/mydb").unwrap();
+        assert_eq!(pg.capability().driver_name, "PostgreSQL");
+        assert!(pg.capability().savepoints);
+
+        let dsql = pg.aurora_dsql();
+        assert_eq!(dsql.capability().driver_name, "Aurora DSQL");
+        assert!(!dsql.capability().savepoints);
+    }
+
+    #[test]
+    fn dsql_options_validated() {
+        let pg = || PostgreSQL::new("postgresql://localhost/mydb").unwrap();
+
+        assert!(pg().aurora_dsql().identity_cache(1).is_ok());
+        let dsql = pg().aurora_dsql().identity_cache(1).unwrap().dsql.unwrap();
+        assert_eq!(dsql.identity_cache, 1);
+        assert!(pg().aurora_dsql().identity_cache(65_536).is_ok());
+        let err = pg().aurora_dsql().identity_cache(65_535).unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+        let err = pg()
+            .aurora_dsql()
+            .schema_job_timeout(Duration::ZERO)
+            .unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+
+        let err = pg().identity_cache(65_536).unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+        let err = pg()
+            .schema_job_timeout(Duration::from_secs(60))
+            .unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
     }
 }

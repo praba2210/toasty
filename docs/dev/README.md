@@ -26,6 +26,7 @@ Guide-level design documents for specific features. Use
 
 - [Design Overview](./design/README.md)
 - [Atomic Batches for DynamoDB](./design/atomic-batches.md)
+- [Aurora DSQL Support](./design/aurora-dsql.md)
 - [Completing Column Projection](./design/column-projection.md)
 - [Document and Collection Fields](./design/document-fields.md)
 - [DynamoDB Driver Error-Handling Convention](./design/ddb-error-handling.md)

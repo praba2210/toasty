@@ -88,7 +88,7 @@ migration behavior:
 |---|---|---|
 | `path` | `"toasty"` | Base directory for migration files, snapshots, and history |
 | `prefix_style` | `"Sequential"` | File naming: `"Sequential"` (0001_, 0002_) or `"Timestamp"` (20240112_153045_) |
-| `flavor` | unset | Database flavor used when `--flavor` is not passed: `"sqlite"`, `"postgresql"`, `"mysql"`, `"mariadb"`, or `"turso"` |
+| `flavor` | unset | Database flavor used when `--flavor` is not passed: `"sqlite"`, `"postgresql"`, `"mysql"`, `"mariadb"`, `"turso"`, or `"aurora-dsql"` |
 | `table_name_prefix` | unset | Prefix applied to every table name in the extracted schema |
 
 Set `table_name_prefix` to the same value the application passes to
@@ -163,7 +163,9 @@ toasty migrate apply --url sqlite:./my_app.db
 The CLI reads `history.toml` to find all defined migrations, then queries the
 database's `__toasty_migrations` tracking table to see which ones have already
 been applied. It executes each pending migration in order inside a transaction
-and records it in the tracking table.
+and records it in the tracking table. With the `aurora-dsql` flavor, it
+connects with the [Aurora DSQL](./aurora-dsql.md#migrations) profile and runs
+each statement on its own.
 
 If all migrations are already applied, the command prints a message and exits
 without changes.

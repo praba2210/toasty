@@ -7,6 +7,9 @@ integrates with Toasty's connection pool for retry and recovery.
 
 [`tokio-postgres`]: https://docs.rs/tokio-postgres
 
+For Amazon Aurora DSQL, which uses this driver with a DSQL profile, see
+[Aurora DSQL](./aurora-dsql.md).
+
 ## Enabling the driver
 
 Add the `postgresql` feature to Toasty in `Cargo.toml`:
@@ -38,7 +41,7 @@ Append query parameters to the URL to tune the connection:
 | `application_name=<string>` | Reported to PostgreSQL as the connecting client. Appears in `pg_stat_activity` and the server log — useful for distinguishing services sharing a database. |
 | `options=<string>` | Server startup options, as libpq's `options` parameter. Use `-c name=value` pairs to set session defaults on every pooled connection — see [Setting the schema search path](#setting-the-schema-search-path). |
 | `sslmode=<mode>` | TLS negotiation mode. See the table below. |
-| `sslrootcert=<path>` | PEM file with root certificates to trust. |
+| `sslrootcert=<path>` | PEM file with root certificates to trust, or `system` for the operating system's trust store (requires `sslmode=verify-full`). |
 | `sslcert=<path>` and `sslkey=<path>` | Client certificate and matching private key, for mutual TLS. |
 | `channel_binding=<mode>` | `disable`, `prefer` (default), or `require`. |
 | `sslnegotiation=<mode>` | `postgres` (default — SSL request over a plain socket) or `direct` (TLS from the first byte). |

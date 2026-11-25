@@ -52,6 +52,7 @@
 # Database Backends
 
 - [PostgreSQL](./postgresql.md)
+- [Aurora DSQL](./aurora-dsql.md)
 - [MySQL](./mysql.md)
 - [SQLite](./sqlite.md)
 - [Turso](./turso.md)

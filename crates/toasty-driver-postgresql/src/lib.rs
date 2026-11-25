@@ -11,6 +11,7 @@
 //! let driver = PostgreSQL::new("postgresql://localhost/mydb").unwrap();
 //! ```
 
+mod dsql;
 mod oid_cache;
 mod statement_cache;
 #[cfg(feature = "tls")]
@@ -21,7 +22,7 @@ mod value;
 pub(crate) use value::Value;
 
 use async_trait::async_trait;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, sync::Arc, time::Duration};
 use toasty_core::{
     Result, Schema,
     driver::{
@@ -89,6 +90,35 @@ pub struct PostgreSQL {
     config: Config,
     #[cfg(feature = "tls")]
     tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
+    capability: &'static Capability,
+    dsql: Option<DsqlSchemaConfig>,
+}
+
+/// Schema-execution settings for Aurora DSQL, read only by this driver.
+#[derive(Debug, Clone)]
+struct DsqlSchemaConfig {
+    /// `CACHE` value for identity columns: 1 or at least 65,536.
+    identity_cache: u32,
+
+    /// How long to wait for an asynchronous index-build job.
+    job_timeout: Duration,
+
+    /// Retries for a schema step the server rejects with SQLSTATE `40001`.
+    schema_retries: u32,
+    schema_retry_base_delay: Duration,
+    schema_retry_max_delay: Duration,
+}
+
+impl Default for DsqlSchemaConfig {
+    fn default() -> Self {
+        Self {
+            identity_cache: 65_536,
+            job_timeout: Duration::from_secs(5 * 60),
+            schema_retries: 3,
+            schema_retry_base_delay: Duration::from_millis(50),
+            schema_retry_max_delay: Duration::from_secs(5),
+        }
+    }
 }
 
 impl std::fmt::Debug for PostgreSQL {
@@ -98,12 +128,16 @@ impl std::fmt::Debug for PostgreSQL {
             config,
             #[cfg(feature = "tls")]
             tls,
+            capability,
+            dsql,
         } = self;
         let mut s = f.debug_struct("PostgreSQL");
         s.field("url", url);
         s.field("config", config);
         #[cfg(feature = "tls")]
         s.field("tls", &tls.as_ref().map(|_| "MakeRustlsConnect"));
+        s.field("capability", &capability.driver_name);
+        s.field("dsql", dsql);
         s.finish()
     }
 }
@@ -222,6 +256,77 @@ impl PostgreSQL {
             config,
             #[cfg(feature = "tls")]
             tls,
+            capability: &Capability::POSTGRESQL,
+            dsql: None,
+        })
+    }
+
+    /// Targets Amazon Aurora DSQL.
+    ///
+    /// Selects [`Capability::AURORA_DSQL`] and DSQL's schema rules:
+    /// `push_schema` and migrations run one DDL statement per transaction,
+    /// build indexes with `CREATE INDEX ASYNC` and wait for the build job,
+    /// render identity columns with `CACHE 65536` by default (see
+    /// [`identity_cache`](Self::identity_cache)), and retry a schema step
+    /// the server rejects with SQLSTATE `40001`.
+    ///
+    /// Without this call the driver behaves as plain PostgreSQL; the host
+    /// name is never inspected.
+    pub fn aurora_dsql(mut self) -> Self {
+        self.capability = &Capability::AURORA_DSQL;
+        self.dsql.get_or_insert_with(DsqlSchemaConfig::default);
+        self
+    }
+
+    /// Sets the `CACHE` value for identity (auto-increment) columns on
+    /// Aurora DSQL. The default is 65,536.
+    ///
+    /// DSQL accepts 1 or at least 65,536. A large cache gives unique but
+    /// non-consecutive ids across connections; 1 gives dense ids at lower
+    /// insert throughput.
+    ///
+    /// Returns [`Error::invalid_driver_configuration`] for any other value,
+    /// or when [`aurora_dsql`](Self::aurora_dsql) was not called first.
+    ///
+    /// [`Error::invalid_driver_configuration`]: toasty_core::Error::invalid_driver_configuration
+    pub fn identity_cache(mut self, cache: u32) -> Result<Self> {
+        let dsql = self.dsql_config_mut("identity_cache")?;
+        if cache != 1 && cache < 65_536 {
+            return Err(toasty_core::Error::invalid_driver_configuration(format!(
+                "Aurora DSQL identity cache must be 1 or at least 65536, got {cache}"
+            )));
+        }
+        dsql.identity_cache = cache;
+        Ok(self)
+    }
+
+    /// Sets how long `push_schema` and migrations wait for an Aurora DSQL
+    /// index-build job. The default is 5 minutes.
+    ///
+    /// When the wait times out, the operation fails and the job keeps running
+    /// on the server.
+    ///
+    /// Returns [`Error::invalid_driver_configuration`] when
+    /// [`aurora_dsql`](Self::aurora_dsql) was not called first, or when
+    /// `timeout` is zero.
+    ///
+    /// [`Error::invalid_driver_configuration`]: toasty_core::Error::invalid_driver_configuration
+    pub fn schema_job_timeout(mut self, timeout: Duration) -> Result<Self> {
+        let dsql = self.dsql_config_mut("schema_job_timeout")?;
+        if timeout.is_zero() {
+            return Err(toasty_core::Error::invalid_driver_configuration(
+                "Aurora DSQL schema job timeout must be greater than zero",
+            ));
+        }
+        dsql.job_timeout = timeout;
+        Ok(self)
+    }
+
+    fn dsql_config_mut(&mut self, option: &str) -> Result<&mut DsqlSchemaConfig> {
+        self.dsql.as_mut().ok_or_else(|| {
+            toasty_core::Error::invalid_driver_configuration(format!(
+                "`{option}` requires `aurora_dsql()` to be called first"
+            ))
         })
     }
 
@@ -241,7 +346,7 @@ impl Driver for PostgreSQL {
     }
 
     fn capability(&self) -> &'static Capability {
-        &Capability::POSTGRESQL
+        self.capability
     }
 
     async fn connect(
@@ -250,10 +355,16 @@ impl Driver for PostgreSQL {
     ) -> toasty_core::Result<Box<dyn toasty_core::driver::Connection>> {
         let mut connection = self.connect_with_config(self.config.clone()).await?;
         connection.query_log = cx.query_log;
+        connection.dsql = self.dsql.clone();
         Ok(Box::new(connection))
     }
 
     async fn reset_db(&self) -> toasty_core::Result<()> {
+        // DSQL has a single database and no CREATE/DROP DATABASE.
+        if let Some(config) = &self.dsql {
+            let mut conn = self.connect_with_config(self.config.clone()).await?;
+            return conn.drop_all_tables(config).await;
+        }
         let dbname = self
             .config
             .get_dbname()
@@ -328,6 +439,13 @@ pub struct Connection {
     /// an error, and tokio-postgres does not expose the `ROLLBACK` command
     /// tag, so the driver tracks the state.
     aborted: bool,
+    dsql: Option<DsqlSchemaConfig>,
+    /// Set when the connection must not be reused (an abandoned `CALL` is
+    /// still running on it).
+    discard: bool,
+    /// The spawned connection task, aborted to close the socket when the
+    /// connection is discarded.
+    task: Option<tokio::task::AbortHandle>,
 }
 
 impl Connection {
@@ -339,6 +457,9 @@ impl Connection {
             oid_cache: OidCache::new(),
             query_log: QueryLogConfig::default(),
             aborted: false,
+            dsql: None,
+            discard: false,
+            task: None,
         }
     }
 
@@ -352,13 +473,16 @@ impl Connection {
     {
         let (client, connection) = config.connect(tls).await.map_err(classify_pg_error)?;
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("connection error: {e}");
             }
         });
 
-        Ok(Self::new(client))
+        Ok(Self {
+            task: Some(task.abort_handle()),
+            ..Self::new(client)
+        })
     }
 
     async fn exec_sql(
@@ -377,6 +501,10 @@ impl Connection {
             .exec_sql_inner(sql_as_str, typed_params, ret, &mut log)
             .await;
         self.track_aborted(&result);
+        // A schema change by another session can leave cached plans stale.
+        if self.dsql.is_some() && matches!(&result, Err(err) if err.is_serialization_failure()) {
+            self.statement_cache.clear();
+        }
         log.finish(&result);
         result
     }
@@ -401,6 +529,18 @@ impl Connection {
         ret: SqlReturn,
         log: &mut QueryLog<'_>,
     ) -> Result<ExecResponse> {
+        let typed_params = if self.dsql.is_some() {
+            typed_params
+                .into_iter()
+                .map(|tv| TypedValue {
+                    ty: dsql::enum_as_text(tv.ty),
+                    value: tv.value,
+                })
+                .collect()
+        } else {
+            typed_params
+        };
+
         self.oid_cache
             .preload(&self.client, typed_params.iter().map(|tv| &tv.ty))
             .await?;
@@ -469,6 +609,22 @@ impl Connection {
     /// Creates a table.
     pub async fn create_table(&mut self, schema: &db::Schema, table: &Table) -> Result<()> {
         let serializer = sql::Serializer::postgresql(schema);
+
+        if let Some(config) = self.dsql.clone() {
+            let options = config.ddl_options();
+            let sql = serializer.serialize(&sql::Statement::create_table_with(
+                table,
+                &Capability::AURORA_DSQL,
+                &options,
+            ));
+            self.exec_ddl(&config, &sql).await?;
+
+            for index in table.indices.iter().filter(|index| !index.primary_key) {
+                let sql = serializer.serialize(&sql::Statement::create_index_with(index, &options));
+                self.exec_ddl(&config, &sql).await?;
+            }
+            return Ok(());
+        }
 
         let sql = serializer.serialize(&sql::Statement::create_table(
             table,
@@ -568,6 +724,10 @@ impl toasty_core::driver::Connection for Connection {
     }
 
     async fn push_schema(&mut self, schema: &Schema) -> Result<()> {
+        // DSQL has no enum types; enums are TEXT columns with a CHECK.
+        if self.dsql.is_some() {
+            return self.push_dsql_schema(&schema.db).await;
+        }
         let serializer = sql::Serializer::postgresql(&schema.db);
 
         // Create PostgreSQL enum types before creating tables.
@@ -599,6 +759,9 @@ impl toasty_core::driver::Connection for Connection {
     async fn applied_migrations(
         &mut self,
     ) -> Result<Vec<toasty_core::schema::db::AppliedMigration>> {
+        if let Some(config) = self.dsql.clone() {
+            return self.dsql_applied_migrations(&config).await;
+        }
         // Ensure the migrations table exists
         self.client
             .execute(
@@ -638,6 +801,11 @@ impl toasty_core::driver::Connection for Connection {
         migration: &toasty_core::schema::db::Migration,
     ) -> Result<()> {
         tracing::info!(id = id, name = %name, "applying migration");
+        if let Some(config) = self.dsql.clone() {
+            return self
+                .apply_dsql_migration(&config, id, name, migration)
+                .await;
+        }
         // Ensure the migrations table exists
         self.client
             .execute(
@@ -685,7 +853,7 @@ impl toasty_core::driver::Connection for Connection {
     }
 
     fn is_valid(&self) -> bool {
-        !self.client.is_closed()
+        !self.discard && !self.client.is_closed()
     }
 
     async fn ping(&mut self) -> Result<()> {
@@ -853,5 +1021,40 @@ mod tests {
             err.to_string().contains("invalid port"),
             "expected invalid-port error, got: {err}"
         );
+    }
+
+    #[test]
+    fn aurora_dsql_selects_dsql_capability() {
+        let pg = PostgreSQL::new("postgresql://localhost/mydb").unwrap();
+        assert_eq!(pg.capability().driver_name, "PostgreSQL");
+        assert!(pg.capability().savepoints);
+
+        let dsql = pg.aurora_dsql();
+        assert_eq!(dsql.capability().driver_name, "Aurora DSQL");
+        assert!(!dsql.capability().savepoints);
+    }
+
+    #[test]
+    fn dsql_options_validated() {
+        let pg = || PostgreSQL::new("postgresql://localhost/mydb").unwrap();
+
+        assert!(pg().aurora_dsql().identity_cache(1).is_ok());
+        let dsql = pg().aurora_dsql().identity_cache(1).unwrap().dsql.unwrap();
+        assert_eq!(dsql.identity_cache, 1);
+        assert!(pg().aurora_dsql().identity_cache(65_536).is_ok());
+        let err = pg().aurora_dsql().identity_cache(65_535).unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+        let err = pg()
+            .aurora_dsql()
+            .schema_job_timeout(Duration::ZERO)
+            .unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+
+        let err = pg().identity_cache(65_536).unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+        let err = pg()
+            .schema_job_timeout(Duration::from_secs(60))
+            .unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
     }
 }

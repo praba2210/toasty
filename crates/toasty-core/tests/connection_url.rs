@@ -122,3 +122,21 @@ fn redacts_authority_password() {
     let url = ConnectionUrl::parse("sqlite::memory:").unwrap();
     assert_eq!(url.redact_password(), "sqlite::memory:");
 }
+
+#[test]
+fn redacts_query_password() {
+    let url = ConnectionUrl::parse(
+        "postgresql://alice:a@localhost/mydb?user=bob&password=b=&pass%77ord=c",
+    )
+    .unwrap();
+    assert_eq!(
+        url.redact_password(),
+        "postgresql://alice:***@localhost/mydb?user=bob&password=***&pass%77ord=***"
+    );
+
+    let url = ConnectionUrl::parse("postgresql://alice@localhost/mydb?password=secret").unwrap();
+    assert_eq!(
+        url.redact_password(),
+        "postgresql://alice@localhost/mydb?password=***"
+    );
+}

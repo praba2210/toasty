@@ -175,6 +175,10 @@ impl<'a> Transaction<'a> {
     /// while the nested one is open. This prevents statements from running
     /// against the outer transaction — bypassing the savepoint — when they
     /// should have gone through the nested handle.
+    ///
+    /// Returns [`Error::unsupported_feature`](crate::Error::unsupported_feature)
+    /// when the database has no savepoints
+    /// ([`Capability::savepoints`](toasty_core::driver::Capability::savepoints)).
     pub async fn transaction(&mut self) -> Result<Transaction<'_>> {
         <Self as Executor>::transaction(self).await
     }
@@ -247,6 +251,13 @@ impl<'a> Executor for Transaction<'a> {
             Some(savepoint) => savepoint + 1,
             None => 1,
         };
+        if !self.conn.shared.engine.capability().savepoints {
+            return Err(crate::Error::unsupported_feature(format!(
+                "nested transactions require savepoints, which {} does not support",
+                self.conn.shared.engine.capability().driver_name
+            )));
+        }
+
         tracing::debug!(depth = depth, "creating nested transaction (savepoint)");
 
         let transaction = Transaction {

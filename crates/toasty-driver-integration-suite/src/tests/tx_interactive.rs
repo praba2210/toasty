@@ -157,7 +157,7 @@ pub async fn commit_after_failed_statement_matches_persisted_data(t: &mut Test) 
 
 /// Rolling back a nested transaction undoes a failed statement inside it, so
 /// the outer transaction still commits.
-#[driver_test(requires(sql))]
+#[driver_test(requires(and(sql, savepoints)))]
 pub async fn nested_rollback_after_failed_statement_keeps_outer_commit(t: &mut Test) -> Result<()> {
     #[derive(Debug, toasty::Model)]
     struct Item {
@@ -186,7 +186,7 @@ pub async fn nested_rollback_after_failed_statement_keeps_outer_commit(t: &mut T
 
 /// A multi-statement plan that fails inside a transaction is rolled back to
 /// the engine's savepoint, so the transaction still commits its earlier write.
-#[driver_test(requires(sql))]
+#[driver_test(requires(and(sql, savepoints)))]
 pub async fn failed_multi_op_plan_keeps_outer_commit(t: &mut Test) -> Result<()> {
     #[derive(Debug, toasty::Model)]
     struct Parent {
@@ -415,7 +415,7 @@ pub async fn driver_sees_begin_rollback(t: &mut Test) -> Result<()> {
 
 /// A committed nested transaction (savepoint) persists when the outer
 /// transaction also commits.
-#[driver_test(requires(sql), scenario(crate::scenarios::two_models))]
+#[driver_test(requires(and(sql, savepoints)), scenario(crate::scenarios::two_models))]
 pub async fn nested_commit_both(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -438,7 +438,7 @@ pub async fn nested_commit_both(t: &mut Test) -> Result<()> {
 
 /// Rolling back a nested transaction discards only its changes; the outer
 /// transaction can still commit its own.
-#[driver_test(requires(sql), scenario(crate::scenarios::two_models))]
+#[driver_test(requires(and(sql, savepoints)), scenario(crate::scenarios::two_models))]
 pub async fn nested_rollback_inner(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -462,7 +462,7 @@ pub async fn nested_rollback_inner(t: &mut Test) -> Result<()> {
 
 /// Rolling back the outer transaction discards everything, including changes
 /// from an already-committed nested transaction.
-#[driver_test(requires(sql), scenario(crate::scenarios::two_models))]
+#[driver_test(requires(and(sql, savepoints)), scenario(crate::scenarios::two_models))]
 pub async fn nested_rollback_outer(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -485,7 +485,7 @@ pub async fn nested_rollback_outer(t: &mut Test) -> Result<()> {
 
 /// Dropping a nested transaction without finalize rolls back just that
 /// savepoint.
-#[driver_test(requires(sql), scenario(crate::scenarios::two_models))]
+#[driver_test(requires(and(sql, savepoints)), scenario(crate::scenarios::two_models))]
 pub async fn nested_drop_rolls_back_savepoint(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -509,7 +509,7 @@ pub async fn nested_drop_rolls_back_savepoint(t: &mut Test) -> Result<()> {
 
 /// Verify the driver log for a nested transaction shows SAVEPOINT / RELEASE
 /// SAVEPOINT around the inner work.
-#[driver_test(requires(sql), scenario(crate::scenarios::two_models))]
+#[driver_test(requires(and(sql, savepoints)), scenario(crate::scenarios::two_models))]
 pub async fn nested_driver_sees_savepoint_ops(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -559,7 +559,7 @@ pub async fn nested_driver_sees_savepoint_ops(t: &mut Test) -> Result<()> {
 
 /// Verify the driver log when a nested transaction is rolled back shows
 /// ROLLBACK TO SAVEPOINT.
-#[driver_test(requires(sql), scenario(crate::scenarios::two_models))]
+#[driver_test(requires(and(sql, savepoints)), scenario(crate::scenarios::two_models))]
 pub async fn nested_driver_sees_rollback_to_savepoint(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -606,7 +606,7 @@ pub async fn nested_driver_sees_rollback_to_savepoint(t: &mut Test) -> Result<()
 
 /// Two sequential nested transactions: first committed, second rolled back.
 /// Only data from the first survives.
-#[driver_test(requires(sql), scenario(crate::scenarios::two_models))]
+#[driver_test(requires(and(sql, savepoints)), scenario(crate::scenarios::two_models))]
 pub async fn two_sequential_nested_transactions(t: &mut Test) -> Result<()> {
     let mut db = setup(t).await;
 
@@ -639,7 +639,7 @@ pub async fn two_sequential_nested_transactions(t: &mut Test) -> Result<()> {
 /// interactive transaction, the engine wraps it in SAVEPOINT/RELEASE instead
 /// of BEGIN/COMMIT.
 #[driver_test(
-    requires(sql),
+    requires(and(sql, savepoints)),
     scenario(crate::scenarios::has_many_belongs_to::id_uuid)
 )]
 pub async fn multi_op_inside_tx_uses_savepoints(t: &mut Test) -> Result<()> {
@@ -689,6 +689,104 @@ pub async fn multi_op_inside_tx_uses_savepoints(t: &mut Test) -> Result<()> {
     let todos = user.todos().exec(&mut db).await?;
     assert_eq!(todos.len(), 1);
     assert_eq!(todos[0].title, "task");
+
+    Ok(())
+}
+
+// ===== Backends without savepoints =====
+
+/// Without savepoints, a nested transaction fails fast, and a multi-op plan
+/// runs directly in the transaction.
+#[driver_test(
+    requires(and(sql, not(savepoints))),
+    scenario(crate::scenarios::has_many_belongs_to::id_uuid)
+)]
+pub async fn no_savepoints_nested_rejected_and_multi_op_runs(t: &mut Test) -> Result<()> {
+    let mut db = setup(t).await;
+
+    t.log().clear();
+
+    let mut tx = db.transaction().await?;
+    let err = tx.transaction().await.err().expect("nested transaction");
+    assert!(err.is_unsupported_feature(), "{err}");
+
+    let user = User::create()
+        .name("Alice")
+        .todos([Todo::create().title("task")])
+        .exec(&mut tx)
+        .await?;
+    tx.commit().await?;
+
+    assert_struct!(
+        t.log().pop_op(),
+        Operation::Transaction(Transaction::Start {
+            isolation: None,
+            read_only: false,
+            ..
+        })
+    );
+    assert_struct!(t.log().pop_op(), Operation::Insert(_));
+    assert_struct!(t.log().pop_op(), Operation::Insert(_));
+    assert_struct!(
+        t.log().pop_op(),
+        Operation::Transaction(Transaction::Commit)
+    );
+    assert!(t.log().is_empty());
+
+    assert_eq!(user.todos().exec(&mut db).await?.len(), 1);
+
+    Ok(())
+}
+
+/// Without savepoints, a multi-op plan that fails after writing makes the
+/// commit fail. A stale delete of a `#[version]` parent deletes its children
+/// first, then fails the version check without a statement error.
+#[driver_test(requires(and(sql, not(savepoints))))]
+pub async fn no_savepoints_failed_plan_fails_commit(t: &mut Test) -> Result<()> {
+    #[derive(Debug, toasty::Model)]
+    struct Parent {
+        #[key]
+        #[auto]
+        id: uuid::Uuid,
+
+        name: String,
+
+        #[version]
+        version: u64,
+
+        #[has_many]
+        children: toasty::Deferred<Vec<Child>>,
+    }
+
+    #[derive(Debug, toasty::Model)]
+    struct Child {
+        #[key]
+        #[auto]
+        id: uuid::Uuid,
+
+        #[index]
+        parent_id: uuid::Uuid,
+
+        #[belongs_to(key = parent_id, references = id)]
+        parent: toasty::Deferred<Parent>,
+    }
+
+    let mut db = t.setup_db(models!(Parent, Child)).await;
+
+    let stale = Parent::create()
+        .name("p")
+        .children([Child::create(), Child::create()])
+        .exec(&mut db)
+        .await?;
+    let mut fresh = Parent::filter_by_id(stale.id).get(&mut db).await?;
+    fresh.update().name("q").exec(&mut db).await?;
+
+    let mut tx = db.transaction().await?;
+    let err = stale.delete().exec(&mut tx).await.unwrap_err();
+    assert!(err.is_condition_failed(), "{err}");
+    assert_err!(tx.commit().await);
+
+    assert_eq!(fresh.children().exec(&mut db).await?.len(), 2);
 
     Ok(())
 }

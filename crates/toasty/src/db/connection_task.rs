@@ -10,8 +10,8 @@
 
 use std::sync::Arc;
 
-use toasty_core::driver::operation::RawSql;
-use toasty_core::driver::{Connection, Rows};
+use toasty_core::driver::operation::{Operation, RawSql, Transaction};
+use toasty_core::driver::{Connection, ExecResponse, Rows};
 #[cfg(feature = "migration")]
 use toasty_core::schema::db::{AppliedMigration, Migration};
 use toasty_core::stmt::Value;
@@ -106,6 +106,7 @@ impl ConnectionHandle {
             engine,
             in_rx,
             sweep_waker,
+            tx_failed: false,
         };
         let join_handle = tokio::spawn(task.run());
         Self { in_tx, join_handle }
@@ -135,6 +136,9 @@ struct ConnectionTask {
     engine: Engine,
     in_rx: mpsc::UnboundedReceiver<ConnectionOperation>,
     sweep_waker: Arc<SweepWaker>,
+    /// Set when an operation that would have used a savepoint failed in the
+    /// open transaction (see [`Engine::exec_plan`]); its commit must fail.
+    tx_failed: bool,
 }
 
 impl ConnectionTask {
@@ -168,11 +172,7 @@ impl ConnectionTask {
                 span,
                 tx,
             } => {
-                let result = self
-                    .connection
-                    .exec(&self.engine.schema, *operation)
-                    .instrument(span)
-                    .await;
+                let result = self.exec_operation(*operation).instrument(span).await;
                 self.respond(tx, result)
             }
             ConnectionOperation::ExecRawSql { raw, span, tx } => {
@@ -226,7 +226,12 @@ impl ConnectionTask {
         let single = stmt.is_single();
         let mut response = self
             .engine
-            .exec(&mut *self.connection, stmt, in_transaction)
+            .exec(
+                &mut *self.connection,
+                stmt,
+                in_transaction,
+                &mut self.tx_failed,
+            )
             .await?;
         response.values.buffer().await?;
 
@@ -243,6 +248,26 @@ impl ConnectionTask {
         }
 
         Ok(response)
+    }
+
+    async fn exec_operation(&mut self, operation: Operation) -> crate::Result<ExecResponse> {
+        if let Operation::Transaction(t) = &operation {
+            match t {
+                // The caller's `Transaction` rolls back when its commit fails.
+                Transaction::Commit if self.tx_failed => {
+                    return Err(crate::Error::driver_operation_failed(
+                        std::io::Error::other(
+                            "transaction was aborted by an earlier error and has been rolled back",
+                        ),
+                    ));
+                }
+                Transaction::Start { .. } | Transaction::Commit | Transaction::Rollback => {
+                    self.tx_failed = false;
+                }
+                _ => {}
+            }
+        }
+        self.connection.exec(&self.engine.schema, operation).await
     }
 
     /// Send `result` to the caller, but if the connection reported

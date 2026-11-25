@@ -60,6 +60,7 @@ fn main() {
     generate_readme_tests(base, &out_dir);
     generate_guide_tests(base, &out_dir);
     detect_postgres_tls();
+    detect_dsql();
 }
 
 /// Set `cfg(toasty_postgres_tls)` when `TOASTY_TEST_POSTGRES_TLS_URL` is set at
@@ -71,6 +72,18 @@ fn detect_postgres_tls() {
     println!("cargo::rustc-check-cfg=cfg(toasty_postgres_tls)");
     if env::var_os("TOASTY_TEST_POSTGRES_TLS_URL").is_some_and(|v| !v.is_empty()) {
         println!("cargo::rustc-cfg=toasty_postgres_tls");
+    }
+}
+
+/// Set `cfg(toasty_dsql)` when `TOASTY_TEST_DSQL_HOST` is set at build time.
+/// The Aurora DSQL target generates the suite only under this cfg, and reports
+/// one ignored test otherwise. The token is read at run time, so a new token
+/// does not rebuild the crate.
+fn detect_dsql() {
+    println!("cargo::rerun-if-env-changed=TOASTY_TEST_DSQL_HOST");
+    println!("cargo::rustc-check-cfg=cfg(toasty_dsql)");
+    if env::var_os("TOASTY_TEST_DSQL_HOST").is_some_and(|v| !v.is_empty()) {
+        println!("cargo::rustc-cfg=toasty_dsql");
     }
 }
 

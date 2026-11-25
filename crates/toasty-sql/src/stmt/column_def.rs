@@ -1,4 +1,4 @@
-use super::CheckConstraint;
+use super::{CheckConstraint, DdlOptions};
 
 use toasty_core::{
     driver::{self, Capability},
@@ -19,6 +19,9 @@ pub struct ColumnDef {
     pub auto_increment: bool,
     /// Optional CHECK constraint on this column.
     pub check: Option<CheckConstraint>,
+    /// `CACHE` value rendered on a PostgreSQL identity column, from
+    /// [`DdlOptions::identity_cache`].
+    pub identity_cache: Option<u32>,
 }
 
 impl ColumnDef {
@@ -26,6 +29,7 @@ impl ColumnDef {
         column: &Column,
         _storage_types: &driver::StorageTypes,
         capability: &Capability,
+        options: &DdlOptions,
     ) -> Self {
         // For SQLite enum columns: store as TEXT with a CHECK constraint instead
         // of db::Type::Enum. The CHECK constraint restricts values to the
@@ -50,6 +54,7 @@ impl ColumnDef {
                         ),
                     )),
                 }),
+                identity_cache: options.identity_cache,
             };
         }
 
@@ -59,6 +64,7 @@ impl ColumnDef {
             not_null: !column.nullable,
             auto_increment: column.auto_increment,
             check: None,
+            identity_cache: options.identity_cache,
         }
     }
 }

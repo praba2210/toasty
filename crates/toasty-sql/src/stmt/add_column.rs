@@ -1,4 +1,4 @@
-use super::{ColumnDef, Statement};
+use super::{ColumnDef, DdlOptions, Statement};
 
 use toasty_core::{
     driver::Capability,
@@ -18,9 +18,18 @@ pub struct AddColumn {
 impl Statement {
     /// Adds a column to a table.
     pub fn add_column(table: TableId, column: &Column, capability: &Capability) -> Self {
+        Self::add_column_with(table, column, capability, &DdlOptions::default())
+    }
+
+    pub(crate) fn add_column_with(
+        table: TableId,
+        column: &Column,
+        capability: &Capability,
+        options: &DdlOptions,
+    ) -> Self {
         AddColumn {
             table,
-            column: ColumnDef::from_schema(column, &capability.storage_types, capability),
+            column: ColumnDef::from_schema(column, &capability.storage_types, capability, options),
         }
         .into()
     }

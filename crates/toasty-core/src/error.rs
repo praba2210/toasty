@@ -21,6 +21,7 @@ mod invalid_statement;
 mod invalid_type_conversion;
 mod read_only_transaction;
 mod record_not_found;
+mod retries_exhausted;
 mod serialization_failure;
 mod transaction_timeout;
 mod unsupported_feature;
@@ -41,6 +42,7 @@ use invalid_statement::InvalidStatement;
 use invalid_type_conversion::InvalidTypeConversion;
 use read_only_transaction::ReadOnlyTransaction;
 use record_not_found::RecordNotFound;
+use retries_exhausted::RetriesExhausted;
 use serialization_failure::SerializationFailure;
 use std::sync::Arc;
 use transaction_timeout::TransactionTimeout;
@@ -115,6 +117,7 @@ enum ErrorKind {
     InvalidTypeConversion(InvalidTypeConversion),
     InvalidRecordCount(InvalidRecordCount),
     RecordNotFound(RecordNotFound),
+    RetriesExhausted(RetriesExhausted),
     InvalidResult(InvalidResult),
     InvalidSchema(InvalidSchema),
     InvalidStatement(InvalidStatement),
@@ -183,6 +186,7 @@ impl std::error::Error for Error {
             ErrorKind::DriverOperationFailed(err) => Some(err),
             ErrorKind::ConnectionLost(err) => Some(err),
             ErrorKind::ConnectionPool(err) => Some(err),
+            ErrorKind::RetriesExhausted(err) => Some(&err.last),
             _ => None,
         }
     }
@@ -229,6 +233,7 @@ impl core::fmt::Display for ErrorKind {
             InvalidTypeConversion(err) => core::fmt::Display::fmt(err, f),
             InvalidRecordCount(err) => core::fmt::Display::fmt(err, f),
             RecordNotFound(err) => core::fmt::Display::fmt(err, f),
+            RetriesExhausted(err) => core::fmt::Display::fmt(err, f),
             InvalidResult(err) => core::fmt::Display::fmt(err, f),
             InvalidSchema(err) => core::fmt::Display::fmt(err, f),
             InvalidStatement(err) => core::fmt::Display::fmt(err, f),

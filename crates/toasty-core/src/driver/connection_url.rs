@@ -167,26 +167,55 @@ impl<'a> ConnectionUrl<'a> {
             .flat_map(|query| form_urlencoded::parse(query.as_bytes()))
     }
 
-    /// Returns the URL with an authority password replaced by `***`.
+    /// Returns the URL with an authority password and the values of `password`
+    /// query parameters replaced by `***`.
     pub fn redact_password(&self) -> Cow<'a, str> {
-        let Some(authority) = self.authority_range() else {
+        let mut ranges = Vec::new();
+        ranges.extend(self.authority_password_range());
+        ranges.extend(self.query_password_ranges());
+
+        if ranges.is_empty() {
             return Cow::Borrowed(self.value);
-        };
+        }
+
+        let mut redacted = String::with_capacity(self.value.len());
+        let mut end = 0;
+        for range in ranges {
+            redacted.push_str(&self.value[end..range.start]);
+            redacted.push_str("***");
+            end = range.end;
+        }
+        redacted.push_str(&self.value[end..]);
+        Cow::Owned(redacted)
+    }
+
+    fn authority_password_range(&self) -> Option<Range<usize>> {
+        let authority = self.authority_range()?;
         let authority_value = &self.rest()[authority.clone()];
-        let Some((userinfo, _)) = authority_value.rsplit_once('@') else {
-            return Cow::Borrowed(self.value);
-        };
-        let Some((username, _)) = userinfo.split_once(':') else {
-            return Cow::Borrowed(self.value);
-        };
+        let (userinfo, _) = authority_value.rsplit_once('@')?;
+        let (username, _) = userinfo.split_once(':')?;
 
         let password_start = self.scheme_end + 1 + authority.start + username.len() + 1;
         let password_end = self.scheme_end + 1 + authority.start + userinfo.len();
-        let mut redacted = String::with_capacity(self.value.len());
-        redacted.push_str(&self.value[..password_start]);
-        redacted.push_str("***");
-        redacted.push_str(&self.value[password_end..]);
-        Cow::Owned(redacted)
+        Some(password_start..password_end)
+    }
+
+    fn query_password_ranges(&self) -> Vec<Range<usize>> {
+        let Some(query) = self.query_range() else {
+            return Vec::new();
+        };
+
+        let mut ranges = Vec::new();
+        let mut pair_start = query.start;
+        for pair in self.value[query].split('&') {
+            if let Some((key, _)) = pair.split_once('=')
+                && form_urlencoded::parse(key.as_bytes()).any(|(key, _)| key == "password")
+            {
+                ranges.push(pair_start + key.len() + 1..pair_start + pair.len());
+            }
+            pair_start += pair.len() + 1;
+        }
+        ranges
     }
 
     fn rest(&self) -> &'a str {
@@ -220,13 +249,19 @@ impl<'a> ConnectionUrl<'a> {
     }
 
     fn query(&self) -> Option<&'a str> {
+        self.query_range().map(|range| &self.value[range])
+    }
+
+    fn query_range(&self) -> Option<Range<usize>> {
         let rest = self.rest();
         let query_start = rest.find('?')?;
         if rest[..query_start].contains('#') {
             return None;
         }
 
-        Some(split_before(&rest[query_start + 1..], &['#']))
+        let start = self.scheme_end + 1 + query_start + 1;
+        let len = split_before(&rest[query_start + 1..], &['#']).len();
+        Some(start..start + len)
     }
 
     fn invalid_authority(&self) -> Error {

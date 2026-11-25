@@ -44,9 +44,10 @@
 //!
 //! - A retryable transaction conflict (PostgreSQL SQLSTATE `40001`,
 //!   MySQL error `1213`) SHOULD be classified as
-//!   [`crate::Error::serialization_failure`]. The engine does not retry
-//!   automatically; the classification is propagated to user code so
-//!   the caller can decide.
+//!   [`crate::Error::serialization_failure`]. The engine never retries
+//!   unless the application opts in (`occ_retry` or
+//!   `transaction_with_retry` in `toasty`); otherwise the classification
+//!   is propagated to user code so the caller can decide.
 //!
 //! - A write attempted against a read-only session (PostgreSQL
 //!   `25006`, MySQL `1792`) SHOULD be classified as

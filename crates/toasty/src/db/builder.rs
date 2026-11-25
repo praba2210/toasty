@@ -1,6 +1,6 @@
 use crate::{
     Db, Result,
-    db::{Connect, Pool, Shared, pool::PoolConfig},
+    db::{Connect, Pool, RetryPolicy, Shared, pool::PoolConfig},
     engine::Engine,
 };
 
@@ -53,6 +53,9 @@ pub struct Builder {
 
     /// Connection pool configuration
     pool: PoolConfig,
+
+    /// Optimistic-concurrency retry for statements outside a transaction
+    occ_retry: Option<RetryPolicy>,
 }
 
 impl Builder {
@@ -214,6 +217,24 @@ impl Builder {
         self
     }
 
+    /// Retries statements run outside a transaction when they fail with an
+    /// optimistic-concurrency conflict
+    /// ([`Error::is_serialization_failure`](crate::Error::is_serialization_failure)).
+    ///
+    /// Off by default. Use it with backends that resolve conflicts at commit
+    /// time, such as Aurora DSQL. A statement that fails this way did not
+    /// commit, so Toasty plans and runs it again, up to `policy`. Statements
+    /// inside a transaction are never retried one by one; use
+    /// [`Db::transaction_with_retry`](crate::Db::transaction_with_retry) to
+    /// retry a whole transaction. The policy also applies to
+    /// `transaction_with_retry`. Raw SQL statements are never retried, and a
+    /// transaction started with raw SQL (`BEGIN`) is not seen as one, so do
+    /// not combine it with `occ_retry`.
+    pub fn occ_retry(&mut self, policy: RetryPolicy) -> &mut Self {
+        self.occ_retry = Some(policy);
+        self
+    }
+
     /// Build and return the app-level schema from the registered models
     /// without opening a database connection.
     ///
@@ -298,7 +319,11 @@ impl Builder {
         let engine = Engine::new(Arc::new(schema), capability);
         let pool = Pool::new(driver, engine.clone(), self.pool.clone())?;
 
-        let shared = Arc::new(Shared { engine, pool });
+        let shared = Arc::new(Shared {
+            engine,
+            pool,
+            occ_retry: self.occ_retry.clone(),
+        });
 
         // see if we're able to acquire a valid connection
         let conn = shared.pool.get(shared.clone()).await?;

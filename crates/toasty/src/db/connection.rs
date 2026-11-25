@@ -67,6 +67,25 @@ impl Connection {
         stmt: stmt::Statement,
         in_transaction: bool,
     ) -> crate::Result<ExecResponse> {
+        // A statement outside a transaction that failed with a serialization
+        // failure did not commit, so it is safe to plan and run it again.
+        let Some(policy) = self.shared.occ_retry.as_ref().filter(|_| !in_transaction) else {
+            return self.exec_stmt_once(stmt, in_transaction).await;
+        };
+        let mut retries = 0;
+        loop {
+            match self.exec_stmt_once(stmt.clone(), false).await {
+                Err(err) => tokio::time::sleep(policy.next_retry(&mut retries, err)?).await,
+                result => return result,
+            }
+        }
+    }
+
+    pub(crate) async fn exec_stmt_once(
+        &self,
+        stmt: stmt::Statement,
+        in_transaction: bool,
+    ) -> crate::Result<ExecResponse> {
         // Created on the caller's task so the span parents to the caller's
         // current span; the worker task enters it while executing.
         let span = crate::instrument::query_span(&self.shared.engine.schema, &stmt);
@@ -140,6 +159,44 @@ impl Connection {
     /// `Connection` stays locked for the lifetime of the transaction.
     pub fn transaction_builder(&mut self) -> super::TransactionBuilder<'_> {
         super::TransactionBuilder::new(super::tx::TxSource::Connection(self))
+    }
+
+    /// Runs `f` in a transaction on this connection and commits it, re-running
+    /// the whole transaction when it fails with an optimistic-concurrency
+    /// conflict. See [`Db::transaction_with_retry`](super::Db::transaction_with_retry).
+    ///
+    /// `f` returns [`crate::Result<T>`]. Where the returned future must be
+    /// `Send` (for example in `tokio::spawn` or an axum handler), `f` must be
+    /// an `async move` closure that owns what it captures.
+    pub async fn transaction_with_retry<T, F>(&mut self, mut f: F) -> crate::Result<T>
+    where
+        F: AsyncFnMut(&mut super::Transaction<'_>) -> crate::Result<T>,
+    {
+        let policy = self.shared.occ_retry.clone().unwrap_or_default();
+        let mut retries = 0;
+        loop {
+            match self.transaction_once(&mut f).await {
+                Err(err) => tokio::time::sleep(policy.next_retry(&mut retries, err)?).await,
+                result => return result,
+            }
+        }
+    }
+
+    /// One attempt of `transaction_with_retry`: runs `f` in a transaction and
+    /// commits it, or rolls it back when `f` fails.
+    pub(crate) async fn transaction_once<T, F>(&mut self, f: &mut F) -> crate::Result<T>
+    where
+        F: AsyncFnMut(&mut super::Transaction<'_>) -> crate::Result<T>,
+    {
+        let mut tx = self.transaction().await?;
+        match f(&mut tx).await {
+            Ok(value) => tx.commit().await.map(|()| value),
+            Err(err) => {
+                // Best effort: the original error is the one to report.
+                let _ = tx.rollback().await;
+                Err(err)
+            }
+        }
     }
 
     /// Creates tables and indices defined in the schema on the database.

@@ -4,8 +4,9 @@ use super::Error;
 ///
 /// Drivers should classify retryable transaction conflicts here:
 /// PostgreSQL SQLSTATE `40001`, MySQL error `1213`, and equivalents on
-/// other backends. The engine does not retry automatically — the error
-/// propagates to the caller, who decides whether to re-run the
+/// other backends. The engine never retries unless the application opts in
+/// (`occ_retry` or `transaction_with_retry` in `toasty`); otherwise the
+/// error propagates to the caller, who decides whether to re-run the
 /// transaction.
 #[derive(Debug)]
 pub(super) struct SerializationFailure {

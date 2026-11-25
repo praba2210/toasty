@@ -26,7 +26,7 @@ struct Palette {
 }
 
 /// A `Vec<unit-enum>` round-trips through INSERT and a fresh fetch.
-#[driver_test(requires(document_collections))]
+#[driver_test(requires(and(document_collections, vec_scalar)))]
 pub async fn vec_enum_create_get(t: &mut Test) -> Result<(), BoxError> {
     let mut db = t.setup_db(models!(Palette)).await;
 
@@ -42,7 +42,7 @@ pub async fn vec_enum_create_get(t: &mut Test) -> Result<(), BoxError> {
 /// The scalar-collection operators unlocked by the emitted `Scalar` impl:
 /// `contains(variant)` matches on discriminant membership and `len()` filters
 /// on cardinality.
-#[driver_test(requires(document_collections))]
+#[driver_test(requires(and(document_collections, vec_scalar)))]
 pub async fn vec_enum_contains_and_len(t: &mut Test) -> Result<(), BoxError> {
     let mut db = t.setup_db(models!(Palette)).await;
 
@@ -74,7 +74,7 @@ pub async fn vec_enum_contains_and_len(t: &mut Test) -> Result<(), BoxError> {
 
 /// Enum-level storage applies to collection elements, while a field-level
 /// type overrides that default. Both paths bridge and round-trip each element.
-#[driver_test(requires(document_collections))]
+#[driver_test(requires(and(document_collections, vec_scalar)))]
 pub async fn vec_enum_uses_discriminant_storage(t: &mut Test) -> Result<(), BoxError> {
     #[derive(Clone, Copy, Debug, PartialEq, toasty::Embed)]
     #[column(type = u16)]

@@ -412,7 +412,7 @@ pub async fn upsert_update_can_reference_stored_value(test: &mut Test) -> Result
 }
 
 #[driver_test(
-    requires(upsert_primary_key),
+    requires(and(upsert_primary_key, vec_scalar)),
     scenario(crate::scenarios::upsert_models)
 )]
 pub async fn upsert_shared_assignment_operators(test: &mut Test) -> Result<()> {
@@ -456,7 +456,7 @@ pub async fn upsert_shared_assignment_operators(test: &mut Test) -> Result<()> {
     Ok(())
 }
 
-#[driver_test(requires(upsert_primary_key))]
+#[driver_test(requires(and(upsert_primary_key, vec_scalar)))]
 pub async fn upsert_shared_mutations_apply_declared_defaults(test: &mut Test) -> Result<()> {
     #[derive(Debug, toasty::Model)]
     struct Item {

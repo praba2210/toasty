@@ -28,7 +28,7 @@ use toasty_core::{
     driver::{
         Capability, ConnectContext, ConnectionUrl, Driver, ExecResponse, Operation, QueryLogConfig,
         log::QueryLog,
-        operation::{RawSqlRet, Transaction, TransactionMode, TypedValue},
+        operation::{IsolationLevel, RawSqlRet, Transaction, TransactionMode, TypedValue},
     },
     schema::db::{self, Table},
     stmt,
@@ -74,6 +74,31 @@ fn is_server_error(err: &toasty_core::Error) -> bool {
     err.is_driver_operation_failed()
         || err.is_serialization_failure()
         || err.is_read_only_transaction()
+}
+
+/// Aurora DSQL runs every transaction at `REPEATABLE READ` and rejects
+/// `BEGIN ISOLATION LEVEL` with any other level, so a `Start` that names a
+/// level is sent without it. Returns `None` when `t` needs no change.
+fn dsql_transaction_start(t: &Transaction) -> Option<Transaction> {
+    let Transaction::Start {
+        isolation: Some(level),
+        read_only,
+        mode,
+    } = *t
+    else {
+        return None;
+    };
+    if level != IsolationLevel::RepeatableRead {
+        tracing::warn!(
+            "Aurora DSQL supports only REPEATABLE READ; running the transaction at \
+             REPEATABLE READ instead of {level:?}"
+        );
+    }
+    Some(Transaction::Start {
+        isolation: None,
+        read_only,
+        mode,
+    })
 }
 
 /// A PostgreSQL [`Driver`] that connects via `tokio-postgres`.
@@ -268,7 +293,9 @@ impl PostgreSQL {
     /// build indexes with `CREATE INDEX ASYNC` and wait for the build job,
     /// render identity columns with `CACHE 65536` by default (see
     /// [`identity_cache`](Self::identity_cache)), and retry a schema step
-    /// the server rejects with SQLSTATE `40001`.
+    /// the server rejects with SQLSTATE `40001`. Transactions run at
+    /// `REPEATABLE READ` whatever isolation level is requested, with a
+    /// warning when it differs.
     ///
     /// Without this call the driver behaves as plain PostgreSQL; the host
     /// name is never inspected.
@@ -680,6 +707,8 @@ impl toasty_core::driver::Connection for Connection {
                     "PostgreSQL does not support TransactionMode::{mode:?}"
                 )));
             }
+            let dsql_start = self.dsql.as_ref().and_then(|_| dsql_transaction_start(t));
+            let t = dsql_start.as_ref().unwrap_or(t);
             let sql = sql::Serializer::postgresql(&schema.db).serialize_transaction(t);
             let commit_after_abort = matches!(t, Transaction::Commit) && self.aborted;
             let result = self
@@ -1024,6 +1053,36 @@ mod tests {
             err.to_string().contains("invalid port"),
             "expected invalid-port error, got: {err}"
         );
+    }
+
+    #[test]
+    fn dsql_transaction_start_drops_isolation_level() {
+        use IsolationLevel::*;
+
+        for level in [ReadUncommitted, ReadCommitted, RepeatableRead, Serializable] {
+            for read_only in [false, true] {
+                let t = Transaction::Start {
+                    isolation: Some(level),
+                    read_only,
+                    mode: TransactionMode::Default,
+                };
+                let start = dsql_transaction_start(&t);
+                assert!(
+                    matches!(
+                        start,
+                        Some(Transaction::Start {
+                            isolation: None,
+                            read_only: r,
+                            mode: TransactionMode::Default,
+                        }) if r == read_only
+                    ),
+                    "{level:?}, read_only = {read_only}: {start:?}"
+                );
+            }
+        }
+
+        assert!(dsql_transaction_start(&Transaction::start()).is_none());
+        assert!(dsql_transaction_start(&Transaction::Commit).is_none());
     }
 
     #[test]

@@ -464,3 +464,79 @@ debug = "line-tables-only"
     let sql = fs::read_to_string(dir.path().join("toasty/migrations/0000_init.sql")).unwrap();
     assert!(sql.contains("CREATE TABLE \"users\""), "{sql}");
 }
+
+/// With the `aurora-dsql` flavor, from Toasty.toml or `--flavor`, `migrate
+/// apply` and `migrate reset` connect with the Aurora DSQL profile, which runs
+/// each migration step on its own; other flavors connect as before. Runs
+/// against the PostgreSQL database in `TOASTY_TEST_POSTGRES_URL` and drops
+/// every table in it.
+#[cfg(feature = "postgresql")]
+#[test]
+fn apply_and_reset_use_the_aurora_dsql_profile() {
+    let Ok(url) = std::env::var("TOASTY_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    scaffold_project(dir.path(), true);
+    fs::write(
+        dir.path().join("Toasty.toml"),
+        "[migration]\npath = \"toasty\"\nprefix_style = \"Sequential\"\nflavor = \"aurora-dsql\"\n",
+    )
+    .unwrap();
+
+    let output = toasty(dir.path(), &["migrate", "generate", "--name", "init"]);
+    assert_success(&output);
+    let sql = fs::read_to_string(dir.path().join("toasty/migrations/0000_init.sql")).unwrap();
+    assert!(sql.contains("-- #[toasty::breakpoint]"), "{sql}");
+    assert!(sql.contains("CREATE UNIQUE INDEX ASYNC"), "{sql}");
+
+    // PostgreSQL has no `CREATE INDEX ASYNC`, so step 2 fails. Only the DSQL
+    // profile runs the steps one at a time and keeps step 1 applied.
+    let step_failure = |output: &Output| {
+        assert!(!output.status.success());
+        String::from_utf8_lossy(&output.stderr).contains("earlier statements stay applied")
+    };
+    let reset = ["migrate", "reset", "--url", &url, "--yes"];
+    let wipe = [
+        &reset[..],
+        &["--skip-migrations", "--flavor", "aurora-dsql"],
+    ]
+    .concat();
+    let apply = ["migrate", "apply", "--url", &url];
+    let dsql = ["--flavor", "aurora-dsql"];
+
+    assert!(step_failure(&toasty(dir.path(), &reset)));
+    assert_success(&toasty(dir.path(), &wipe));
+    assert!(step_failure(&toasty(dir.path(), &apply)));
+
+    // The flag alone selects the profile.
+    fs::write(
+        dir.path().join("Toasty.toml"),
+        "[migration]\npath = \"toasty\"\nprefix_style = \"Sequential\"\n",
+    )
+    .unwrap();
+    assert!(step_failure(&toasty(
+        dir.path(),
+        &[&reset[..], &dsql].concat()
+    )));
+    assert_success(&toasty(dir.path(), &wipe));
+    assert!(step_failure(&toasty(
+        dir.path(),
+        &[&apply[..], &dsql].concat()
+    )));
+
+    // Plain PostgreSQL applies the whole migration as one step and rejects
+    // `ASYNC`.
+    assert_success(&toasty(dir.path(), &wipe));
+    let output = toasty(
+        dir.path(),
+        &[&apply[..], &["--flavor", "postgresql"]].concat(),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !step_failure(&output) && stderr.contains("syntax error"),
+        "{stderr}"
+    );
+
+    assert_success(&toasty(dir.path(), &wipe));
+}

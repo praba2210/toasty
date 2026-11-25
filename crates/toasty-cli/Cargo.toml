@@ -20,7 +20,7 @@ path = "src/bin/toasty.rs"
 [features]
 default = ["sqlite", "postgresql", "mysql", "mariadb"]
 sqlite = ["toasty/sqlite"]
-postgresql = ["toasty/postgresql"]
+postgresql = ["toasty/postgresql", "dep:toasty-driver-postgresql"]
 mysql = ["toasty/mysql"]
 mariadb = ["toasty/mariadb"]
 turso = ["toasty/turso"]
@@ -36,6 +36,7 @@ toasty = { workspace = true, features = [
 	"rust_decimal",
 ] }
 toasty-core.workspace = true
+toasty-driver-postgresql = { workspace = true, optional = true }
 
 anyhow = "1.0.102"
 cargo_metadata.workspace = true

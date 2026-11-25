@@ -8,6 +8,8 @@ use toasty_core::{
     },
 };
 
+mod aurora_dsql;
+
 use crate::Serializer;
 use crate::stmt::{
     AlterColumnChanges, AlterTable, AlterTableAction, DdlOptions, DropTable, Name, Statement,
@@ -55,6 +57,12 @@ fn is_named_enum_type_only_change(
 /// `capability.sql`. PostgreSQL gets one batch; other dialects get breakpoint
 /// markers so drivers can execute one statement at a time.
 ///
+/// For [`Capability::AURORA_DSQL`] (selected by its `driver_name`), every
+/// statement is its own step, indexes
+/// are built with `CREATE INDEX ASYNC`, and identity columns get
+/// `CACHE 65536`. Call [`validate_migration`] first: this function does not
+/// check that the backend can apply the diff.
+///
 /// # Panics
 ///
 /// Panics if `capability.sql` is `None`.
@@ -63,12 +71,26 @@ pub fn generate_migration(schema_diff: &diff::Schema<'_>, capability: &Capabilit
         .sql
         .expect("cannot generate a SQL migration for a non-SQL capability");
 
-    let statements = MigrationStatement::from_diff(schema_diff, capability);
+    let dsql = aurora_dsql::is_aurora_dsql(capability);
+    let statements = if dsql {
+        MigrationStatement::from_diff_with(
+            schema_diff,
+            &aurora_dsql::MIGRATION_CAPABILITY,
+            &aurora_dsql::DDL_OPTIONS,
+        )
+    } else {
+        MigrationStatement::from_diff(schema_diff, capability)
+    };
 
     let sql_strings: Vec<String> = statements
         .iter()
         .map(|stmt| Serializer::new(dialect, stmt.schema()).serialize(stmt.statement()))
         .collect();
+
+    if dsql {
+        // Aurora DSQL runs one DDL statement per transaction.
+        return Migration::new_sql_with_breakpoints(&sql_strings);
+    }
 
     match dialect {
         Dialect::Postgresql => Migration::new_sql(sql_strings.join("\n")),
@@ -76,6 +98,22 @@ pub fn generate_migration(schema_diff: &diff::Schema<'_>, capability: &Capabilit
             Migration::new_sql_with_breakpoints(&sql_strings)
         }
     }
+}
+
+/// Checks that the backend described by `capability` can apply a schema diff,
+/// before any migration is generated, written, or run.
+///
+/// Returns [`toasty_core::Error::unsupported_feature`] naming the first change
+/// [`Capability::AURORA_DSQL`] cannot apply (for example, a column type
+/// change). Every diff is accepted for the other backends.
+pub fn validate_migration(
+    schema_diff: &diff::Schema<'_>,
+    capability: &Capability,
+) -> toasty_core::Result<()> {
+    if aurora_dsql::is_aurora_dsql(capability) {
+        return aurora_dsql::validate_migration(schema_diff);
+    }
+    Ok(())
 }
 
 /// A migration step pairing a DDL [`Statement`] with the [`Schema`] it applies against.

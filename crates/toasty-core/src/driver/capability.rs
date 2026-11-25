@@ -869,6 +869,9 @@ impl Capability {
     ///
     /// DSQL speaks the PostgreSQL protocol but has no `CREATE TYPE`, no array
     /// columns, no savepoints, and no in-place column type changes.
+    ///
+    /// Migration generation in `toasty-sql` applies DSQL's rules to a
+    /// capability whose `driver_name` is `"Aurora DSQL"`.
     pub const AURORA_DSQL: Self = Self {
         driver_name: "Aurora DSQL",
         storage_types: StorageTypes::AURORA_DSQL,

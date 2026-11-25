@@ -8,7 +8,11 @@ use std::{
     hash::{BuildHasher, RandomState},
     time::Duration,
 };
-use toasty_core::{Error, Result, schema::db};
+use toasty_core::{
+    Error, Result,
+    driver::Capability,
+    schema::{db, diff},
+};
 use toasty_sql::stmt::DdlOptions;
 use tokio_postgres::{SimpleQueryMessage, error::SqlState};
 
@@ -249,8 +253,8 @@ impl Connection {
         for (index, statement) in statements.iter().enumerate() {
             if let Err(err) = self.exec_ddl(config, statement).await {
                 let hint = if is_feature_not_supported(&err) {
-                    "; Aurora DSQL does not support this statement: regenerate the migration with \
-                     `aurora_dsql()` selected"
+                    "; Aurora DSQL does not support this statement: regenerate the migration for \
+                     Aurora DSQL (`--flavor aurora-dsql`)"
                 } else {
                     ""
                 };
@@ -308,65 +312,12 @@ impl Connection {
 
 /// Rejects schema that Aurora DSQL cannot create, before any statement runs.
 pub(crate) fn check_schema(schema: &db::Schema) -> Result<()> {
-    for table in &schema.tables {
-        check_table(table)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn check_table(table: &db::Table) -> Result<()> {
-    for column in &table.columns {
-        check_column(table, column)?;
-    }
-    for index in table.indices.iter().filter(|index| !index.primary_key) {
-        check_index(table, index)?;
-    }
-    Ok(())
-}
-
-pub(crate) fn check_column(table: &db::Table, column: &db::Column) -> Result<()> {
-    // DSQL identity columns must be `bigint`, which PostgreSQL renders for
-    // signed integers of more than 4 bytes and unsigned ones of more than 2.
-    let bigint = matches!(
-        column.storage_ty,
-        db::Type::Integer(5..) | db::Type::UnsignedInteger(3..)
-    );
-    if column.auto_increment && !bigint {
-        return Err(unsupported(
-            column_subject(table, column),
-            "identity columns must be 64-bit; use i64/u64 or a UUID key",
-        ));
-    }
-    if column.storage_ty == db::Type::Numeric(None) {
-        return Err(unsupported(
-            column_subject(table, column),
-            "NUMERIC without precision is numeric(18,6) and rounds to 6 decimal places; \
-             declare a precision and scale, for example `#[column(type = numeric(38, 10))]`",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn check_index(table: &db::Table, index: &db::Index) -> Result<()> {
-    if index
-        .columns
-        .iter()
-        .any(|column| matches!(column.op, db::IndexOp::Sort(_)))
-    {
-        return Err(unsupported(
-            format!("index `{}` on table `{}`", index.name, table.name),
-            "index key sort order is not supported",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn column_subject(table: &db::Table, column: &db::Column) -> String {
-    format!("column `{}.{}`", table.name, column.name)
-}
-
-pub(crate) fn unsupported(subject: impl std::fmt::Display, message: &str) -> Error {
-    Error::unsupported_feature(format!("Aurora DSQL: {subject}: {message}"))
+    let empty = db::Schema::default();
+    let hints = diff::RenameHints::new();
+    toasty_sql::validate_migration(
+        &diff::Schema::from(&empty, schema, &hints),
+        &Capability::AURORA_DSQL,
+    )
 }
 
 /// Binds enum values as TEXT: DSQL stores enums in TEXT columns.
@@ -475,57 +426,6 @@ mod tests {
                 primary_key: false,
             }],
         }
-    }
-
-    #[track_caller]
-    fn assert_rejected(table: db::Table, message: &str) {
-        let err = check_table(&table).unwrap_err();
-        assert!(err.is_unsupported_feature(), "{err}");
-        assert!(err.to_string().contains(message), "{err}");
-    }
-
-    #[test]
-    fn check_accepts_bigint_identity() {
-        check_table(&table(db::Type::Integer(8), true, db::IndexOp::Eq)).unwrap();
-        check_table(&table(db::Type::UnsignedInteger(4), true, db::IndexOp::Eq)).unwrap();
-        check_table(&table(
-            db::Type::Numeric(Some((57, 28))),
-            false,
-            db::IndexOp::Eq,
-        ))
-        .unwrap();
-    }
-
-    #[test]
-    fn check_rejects_narrow_identity() {
-        assert_rejected(
-            table(db::Type::Integer(4), true, db::IndexOp::Eq),
-            "column `users.id`: identity columns must be 64-bit",
-        );
-        assert_rejected(
-            table(db::Type::UnsignedInteger(2), true, db::IndexOp::Eq),
-            "identity columns must be 64-bit",
-        );
-    }
-
-    #[test]
-    fn check_rejects_unbounded_numeric() {
-        assert_rejected(
-            table(db::Type::Numeric(None), false, db::IndexOp::Eq),
-            "NUMERIC without precision",
-        );
-    }
-
-    #[test]
-    fn check_rejects_sorted_index_key() {
-        assert_rejected(
-            table(
-                db::Type::Integer(8),
-                false,
-                db::IndexOp::Sort(stmt::Direction::Desc),
-            ),
-            "index `index_users_by_id` on table `users`: index key sort order is not supported",
-        );
     }
 
     /// A connection with the DSQL profile to the PG instance at

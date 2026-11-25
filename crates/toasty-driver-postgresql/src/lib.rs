@@ -285,6 +285,9 @@ impl PostgreSQL {
     /// non-consecutive ids across connections; 1 gives dense ids at lower
     /// insert throughput.
     ///
+    /// This applies to tables created by `push_schema`. Generated migrations
+    /// always use `CACHE 65536`; edit the migration SQL to change it.
+    ///
     /// Returns [`Error::invalid_driver_configuration`] for any other value,
     /// or when [`aurora_dsql`](Self::aurora_dsql) was not called first.
     ///

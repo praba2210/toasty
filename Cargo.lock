@@ -5200,6 +5200,7 @@ dependencies = [
  "tempfile",
  "toasty",
  "toasty-core",
+ "toasty-driver-postgresql",
  "tokio",
  "toml",
 ]

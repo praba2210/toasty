@@ -22,7 +22,7 @@ mod value;
 pub(crate) use value::Value;
 
 use async_trait::async_trait;
-use std::{borrow::Cow, sync::Arc, time::Duration};
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Duration};
 use toasty_core::{
     Result, Schema,
     driver::{
@@ -117,7 +117,13 @@ pub struct PostgreSQL {
     tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
     capability: &'static Capability,
     dsql: Option<DsqlSchemaConfig>,
+    password_provider: Option<PasswordProvider>,
 }
+
+type PasswordFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<String, BoxError>> + Send + 'static>>;
+type PasswordProvider = Arc<dyn Fn() -> PasswordFuture + Send + Sync>;
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 /// Schema-execution settings for Aurora DSQL, read only by this driver.
 #[derive(Debug, Clone)]
@@ -155,14 +161,21 @@ impl std::fmt::Debug for PostgreSQL {
             tls,
             capability,
             dsql,
+            password_provider,
         } = self;
+        let url = ConnectionUrl::parse(url)
+            .map_or(Cow::Borrowed(url.as_str()), |url| url.redact_password());
         let mut s = f.debug_struct("PostgreSQL");
-        s.field("url", url);
+        s.field("url", &url);
         s.field("config", config);
         #[cfg(feature = "tls")]
         s.field("tls", &tls.as_ref().map(|_| "MakeRustlsConnect"));
         s.field("capability", &capability.driver_name);
         s.field("dsql", dsql);
+        s.field(
+            "password_provider",
+            &password_provider.as_ref().map(|_| "PasswordProvider"),
+        );
         s.finish()
     }
 }
@@ -283,6 +296,7 @@ impl PostgreSQL {
             tls,
             capability: &Capability::POSTGRESQL,
             dsql: None,
+            password_provider: None,
         })
     }
 
@@ -352,6 +366,31 @@ impl PostgreSQL {
         Ok(self)
     }
 
+    /// Sets a function that returns the password for each new connection.
+    ///
+    /// The provider runs once per connection the driver opens: when the pool
+    /// grows or replaces a connection, and for every `reset_db`
+    /// connection. It does not run when a pooled connection is reused. Its
+    /// result overrides any password in the connection URL. Use it for
+    /// short-lived credentials such as Aurora DSQL IAM authentication tokens.
+    ///
+    /// When the provider fails, connecting fails with
+    /// `driver_operation_failed("PostgreSQL password provider failed")`; the
+    /// provider's own error text is not included because it may contain
+    /// secrets.
+    pub fn password_provider<F, Fut, E>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<String, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.password_provider = Some(Arc::new(move || {
+            let fut = provider();
+            Box::pin(async move { fut.await.map_err(Into::into) })
+        }));
+        self
+    }
+
     fn dsql_config_mut(&mut self, option: &str) -> Result<&mut DsqlSchemaConfig> {
         self.dsql.as_mut().ok_or_else(|| {
             toasty_core::Error::invalid_driver_configuration(format!(
@@ -360,7 +399,16 @@ impl PostgreSQL {
         })
     }
 
-    async fn connect_with_config(&self, config: Config) -> Result<Connection> {
+    async fn connect_with_config(&self, mut config: Config) -> Result<Connection> {
+        if let Some(provider) = &self.password_provider {
+            // The provider's error may contain a token, so it is dropped.
+            let password = provider().await.map_err(|_| {
+                toasty_core::Error::driver_operation_failed(std::io::Error::other(
+                    "PostgreSQL password provider failed",
+                ))
+            })?;
+            config.password(password);
+        }
         #[cfg(feature = "tls")]
         if let Some(ref tls) = self.tls {
             return Connection::connect(config, tls.clone()).await;
@@ -1118,5 +1166,33 @@ mod tests {
             .schema_job_timeout(Duration::from_secs(60))
             .unwrap_err();
         assert!(err.is_invalid_driver_configuration(), "{err}");
+    }
+
+    #[test]
+    fn debug_redacts_url_password() {
+        let pg = PostgreSQL::new("postgresql://alice:url-sentinel@localhost/mydb").unwrap();
+        let debug = format!("{pg:?}");
+        assert!(!debug.contains("url-sentinel"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn password_provider_error_has_fixed_message() {
+        let pg = PostgreSQL::new("postgresql://127.0.0.1:1/mydb")
+            .unwrap()
+            .password_provider(|| async { Err::<String, _>("error-sentinel") });
+        let err = pg.connect(&ConnectContext::default()).await.unwrap_err();
+        assert!(err.is_driver_operation_failed(), "{err}");
+        assert_eq!(err.to_string(), "PostgreSQL password provider failed");
+    }
+
+    #[tokio::test]
+    async fn password_provider_result_not_exposed() {
+        let pg = PostgreSQL::new("postgresql://127.0.0.1:1/mydb")
+            .unwrap()
+            .password_provider(|| async { Ok::<_, std::io::Error>("pw-sentinel".to_string()) });
+        let err = pg.connect(&ConnectContext::default()).await.unwrap_err();
+        for text in [err.to_string(), format!("{pg:?}"), pg.url().into_owned()] {
+            assert!(!text.contains("pw-sentinel"), "{text}");
+        }
     }
 }

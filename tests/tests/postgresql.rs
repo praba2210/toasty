@@ -320,3 +320,108 @@ async fn connect_via_unix_socket() {
         .await
         .expect("PostgreSQL connection over Unix-domain socket failed");
 }
+
+/// The password provider runs once for every connection the pool opens
+/// (first, growth, replacement after the lifetime cap), never on reuse, and
+/// its result replaces the URL password.
+#[tokio::test]
+async fn password_provider_per_connection() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+    use toasty_core::driver::{ConnectContext, Driver};
+
+    // Stay off the suite's database: `reset_db` tests recreate it and end
+    // its connections.
+    let mut admin_url = url::Url::parse(
+        &std::env::var("TOASTY_TEST_POSTGRES_URL")
+            .unwrap_or_else(|_| "postgresql://localhost:5432/toasty_test".to_string()),
+    )
+    .expect("failed to parse admin URL");
+    admin_url.set_path("/postgres");
+    let (admin, connection) = tokio_postgres::connect(admin_url.as_str(), NoTls)
+        .await
+        .expect("failed to connect as admin");
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("connection error: {e}");
+        }
+    });
+
+    let role = format!("password_provider_{}", std::process::id());
+    let password = "provider-password";
+    admin
+        .execute(&format!("DROP ROLE IF EXISTS \"{role}\""), &[])
+        .await
+        .expect("failed to drop leftover role");
+    admin
+        .execute(
+            &format!("CREATE ROLE \"{role}\" WITH LOGIN PASSWORD '{password}'"),
+            &[],
+        )
+        .await
+        .expect("failed to create role");
+
+    let url = format!(
+        "postgresql://{role}:wrong@{}:{}/postgres?password=wrong",
+        admin_url.host_str().unwrap_or("localhost"),
+        admin_url.port().unwrap_or(5432),
+    );
+
+    // The server checks passwords, so the URL password alone fails.
+    let without_provider = PostgreSQL::new(&url).unwrap();
+    assert!(
+        without_provider
+            .connect(&ConnectContext::default())
+            .await
+            .is_err()
+    );
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let driver = PostgreSQL::new(&url).unwrap().password_provider({
+        let calls = calls.clone();
+        move || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            async move { Ok::<_, std::io::Error>(password.to_string()) }
+        }
+    });
+    let lifetime = Duration::from_secs(2);
+    let db = toasty::Db::builder()
+        .max_pool_size(2)
+        .pool_health_check_interval(None)
+        .pool_max_connection_lifetime(Some(lifetime))
+        .build(driver)
+        .await
+        .expect("build with password provider failed");
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "first connection");
+
+    for _ in 0..3 {
+        drop(db.connection().await.expect("reuse failed"));
+    }
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "reuse");
+
+    let a = db.connection().await.expect("first checkout failed");
+    let b = db.connection().await.expect("pool growth failed");
+    assert_eq!(calls.load(Ordering::SeqCst), 2, "pool growth");
+    drop((a, b));
+
+    tokio::time::sleep(lifetime + Duration::from_millis(200)).await;
+    drop(db.connection().await.expect("replacement failed"));
+    assert_eq!(calls.load(Ordering::SeqCst), 3, "replacement");
+
+    let failing = PostgreSQL::new(&url)
+        .unwrap()
+        .password_provider(|| async { Err::<String, _>("error-sentinel") });
+    let err = toasty::Db::builder().build(failing).await.unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("PostgreSQL password provider failed"),
+        "{message}"
+    );
+    assert!(!message.contains("error-sentinel"), "{message}");
+
+    drop(db);
+    admin
+        .execute(&format!("DROP ROLE IF EXISTS \"{role}\""), &[])
+        .await
+        .expect("failed to drop role");
+}

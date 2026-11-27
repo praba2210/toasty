@@ -248,6 +248,59 @@ async fn search_path_via_url_options() {
         .expect("failed to drop schema");
 }
 
+/// A raw-SQL `ROLLBACK TO SAVEPOINT` undoes a failed statement, so the
+/// transaction still commits. MySQL cannot run `SAVEPOINT` as a prepared
+/// statement, so this test is not in the shared suite.
+#[tokio::test]
+async fn raw_rollback_to_savepoint_after_failed_statement_keeps_commit() {
+    #[derive(Debug, toasty::Model)]
+    struct RawSavepointItem {
+        #[key]
+        id: i64,
+    }
+
+    let url = std::env::var("TOASTY_TEST_POSTGRES_URL")
+        .unwrap_or_else(|_| "postgresql://localhost:5432/toasty_test".to_string());
+    let prefix = format!("raw_savepoint_{}_", std::process::id());
+    let mut builder = toasty::Db::builder();
+    builder
+        .models(toasty::models!(RawSavepointItem))
+        .table_name_prefix(&prefix);
+    let mut db = builder.connect(&url).await.expect("connect failed");
+    db.push_schema().await.expect("push_schema failed");
+
+    let mut tx = db.transaction().await.unwrap();
+    RawSavepointItem::create()
+        .id(1)
+        .exec(&mut tx)
+        .await
+        .unwrap();
+    toasty::sql::statement("SAVEPOINT raw")
+        .exec(&mut tx)
+        .await
+        .unwrap();
+    assert!(
+        RawSavepointItem::create()
+            .id(1)
+            .exec(&mut tx)
+            .await
+            .is_err()
+    );
+    toasty::sql::statement("ROLLBACK TO SAVEPOINT raw")
+        .exec(&mut tx)
+        .await
+        .unwrap();
+    tx.commit().await.expect("commit failed");
+
+    let items = RawSavepointItem::all().exec(&mut db).await.unwrap();
+    assert_eq!(items.len(), 1);
+
+    toasty::sql::statement(format!("DROP TABLE \"{prefix}raw_savepoint_items\""))
+        .exec(&mut db)
+        .await
+        .unwrap();
+}
+
 /// Connectivity smoke test for Unix-domain sockets (regression for #984).
 ///
 /// The driver must accept libpq-style `?host=/path` URLs so the

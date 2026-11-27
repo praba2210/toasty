@@ -66,6 +66,15 @@ fn classify_pg_error(e: tokio_postgres::Error) -> toasty_core::Error {
     }
 }
 
+/// Whether `err` is a server-side error, as classified by
+/// [`classify_pg_error`]. Inside a transaction, such an error leaves the
+/// transaction aborted.
+fn is_server_error(err: &toasty_core::Error) -> bool {
+    err.is_driver_operation_failed()
+        || err.is_serialization_failure()
+        || err.is_read_only_transaction()
+}
+
 /// A PostgreSQL [`Driver`] that connects via `tokio-postgres`.
 ///
 /// # Examples
@@ -313,6 +322,12 @@ pub struct Connection {
     statement_cache: StatementCache,
     oid_cache: OidCache,
     query_log: QueryLogConfig,
+    /// Set when the server rejects a statement, which aborts the open
+    /// transaction, and cleared when the server accepts one. PostgreSQL
+    /// answers `COMMIT` on an aborted transaction by rolling it back without
+    /// an error, and tokio-postgres does not expose the `ROLLBACK` command
+    /// tag, so the driver tracks the state.
+    aborted: bool,
 }
 
 impl Connection {
@@ -323,6 +338,7 @@ impl Connection {
             statement_cache: StatementCache::new(100),
             oid_cache: OidCache::new(),
             query_log: QueryLogConfig::default(),
+            aborted: false,
         }
     }
 
@@ -360,8 +376,22 @@ impl Connection {
         let result = self
             .exec_sql_inner(sql_as_str, typed_params, ret, &mut log)
             .await;
+        self.track_aborted(&result);
         log.finish(&result);
         result
+    }
+
+    /// Updates `aborted` from the server's answer to a statement. In an
+    /// aborted transaction PostgreSQL rejects every command except those that
+    /// end the transaction or roll back to a savepoint, so a success means
+    /// the transaction is not aborted. A client-side error never reached the
+    /// server and leaves the state unchanged.
+    fn track_aborted<T>(&mut self, result: &Result<T>) {
+        match result {
+            Ok(_) => self.aborted = false,
+            Err(err) if is_server_error(err) => self.aborted = true,
+            Err(_) => {}
+        }
     }
 
     async fn exec_sql_inner(
@@ -492,10 +522,21 @@ impl toasty_core::driver::Connection for Connection {
                 )));
             }
             let sql = sql::Serializer::postgresql(&schema.db).serialize_transaction(t);
-            self.client
+            let commit_after_abort = matches!(t, Transaction::Commit) && self.aborted;
+            let result = self
+                .client
                 .batch_execute(&sql)
                 .await
-                .map_err(classify_pg_error)?;
+                .map_err(classify_pg_error);
+            self.track_aborted(&result);
+            result?;
+            if commit_after_abort {
+                return Err(toasty_core::Error::driver_operation_failed(
+                    std::io::Error::other(
+                        "transaction was aborted by an earlier error and has been rolled back",
+                    ),
+                ));
+            }
             return Ok(ExecResponse::count(0));
         }
 
@@ -744,6 +785,56 @@ mod tests {
         // `+`) to a space and `%3D` to `=`.
         let c = cfg("postgresql://localhost/mydb?options=-c%20search_path%3Dtenant_a%2Cpublic");
         assert_eq!(c.get_options(), Some("-c search_path=tenant_a,public"));
+    }
+
+    /// A server error from a savepoint command aborts the transaction, so
+    /// committing it returns an error and nothing persists.
+    #[tokio::test]
+    async fn commit_after_failed_savepoint_command_errors() {
+        use toasty_core::driver::{Connection as _, Rows, operation::RawSql};
+
+        let Ok(url) = std::env::var("TOASTY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let mut conn = Connection::connect(cfg(&url), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let app = toasty_core::schema::app::Schema::from_macro([]).unwrap();
+        let schema = Arc::new(
+            toasty_core::schema::Builder::new()
+                .build(app, &Capability::POSTGRESQL)
+                .unwrap(),
+        );
+        let raw = |sql: &str| {
+            Operation::from(RawSql {
+                sql: sql.to_string(),
+                params: vec![],
+                ret: RawSqlRet::None,
+            })
+        };
+
+        conn.exec(&schema, raw("CREATE TEMP TABLE release_failure (id int)"))
+            .await
+            .unwrap();
+        conn.exec(&schema, Transaction::start().into())
+            .await
+            .unwrap();
+        conn.exec(&schema, raw("INSERT INTO release_failure VALUES (1)"))
+            .await
+            .unwrap();
+        let release = Transaction::ReleaseSavepoint("does_not_exist".to_string());
+        assert!(conn.exec(&schema, release.into()).await.is_err());
+        let err = conn
+            .exec(&schema, Transaction::Commit.into())
+            .await
+            .unwrap_err();
+        assert!(err.is_driver_operation_failed(), "{err}");
+
+        let deleted = conn
+            .exec(&schema, raw("DELETE FROM release_failure"))
+            .await
+            .unwrap();
+        assert!(matches!(deleted.values, Rows::Count(0)));
     }
 
     #[test]

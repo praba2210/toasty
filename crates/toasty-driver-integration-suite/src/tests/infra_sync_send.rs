@@ -28,3 +28,22 @@ pub async fn ensure_types_sync_send(t: &mut Test) -> Result<()> {
 
     Ok(())
 }
+
+/// `transaction_with_retry` can run inside `tokio::spawn` with an
+/// `async move` closure that owns its captures.
+#[driver_test(requires(sql), scenario(crate::scenarios::user_unique_email))]
+pub async fn transaction_with_retry_in_spawn(t: &mut Test) -> Result<()> {
+    let mut db = setup(t).await;
+
+    let email = String::from("hello@example.com");
+    let task = tokio::spawn(async move {
+        db.transaction_with_retry(async move |tx| {
+            User::filter_by_email(&email).first().exec(tx).await
+        })
+        .await
+    });
+
+    assert!(task.await.unwrap()?.is_none());
+
+    Ok(())
+}

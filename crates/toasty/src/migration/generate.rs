@@ -1,4 +1,5 @@
 use crate::{
+    Result,
     db::Capability,
     schema::{db, diff},
 };
@@ -22,22 +23,25 @@ pub struct Generated {
 /// Generate a database migration from `previous` to `next`.
 ///
 /// The migration SQL is rendered in the dialect named by `capability.sql`;
-/// no database connection is involved. Returns `None` when the schemas are
-/// equivalent after applying `rename_hints`.
+/// no database connection is involved. Returns `Ok(None)` when the schemas
+/// are equivalent after applying `rename_hints`, and an error when the backend
+/// cannot apply the change (see [`toasty_sql::validate_migration`]).
 pub fn generate(
     capability: &Capability,
     previous: &db::Schema,
     next: &db::Schema,
     rename_hints: &diff::RenameHints,
-) -> Option<Generated> {
+) -> Result<Option<Generated>> {
     let schema_diff = diff::Schema::from(previous, next, rename_hints);
 
     if schema_diff.is_empty() {
-        return None;
+        return Ok(None);
     }
 
-    Some(Generated {
+    toasty_sql::validate_migration(&schema_diff, capability)?;
+
+    Ok(Some(Generated {
         migration: toasty_sql::generate_migration(&schema_diff, capability),
         snapshot: Snapshot::new(next.clone()),
-    })
+    }))
 }

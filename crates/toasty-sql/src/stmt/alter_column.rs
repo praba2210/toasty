@@ -1,4 +1,4 @@
-use crate::stmt::ColumnDef;
+use crate::stmt::{ColumnDef, DdlOptions};
 
 use super::Statement;
 
@@ -110,9 +110,23 @@ impl Statement {
         changes: AlterColumnChanges,
         capability: &Capability,
     ) -> Self {
+        Self::alter_column_with(column, changes, capability, &DdlOptions::default())
+    }
+
+    pub(crate) fn alter_column_with(
+        column: &Column,
+        changes: AlterColumnChanges,
+        capability: &Capability,
+        options: &DdlOptions,
+    ) -> Self {
         AlterColumn {
             id: column.id,
-            column_def: ColumnDef::from_schema(column, &capability.storage_types, capability),
+            column_def: ColumnDef::from_schema(
+                column,
+                &capability.storage_types,
+                capability,
+                options,
+            ),
             changes,
         }
         .into()

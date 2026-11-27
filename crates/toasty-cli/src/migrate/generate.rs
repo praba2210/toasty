@@ -252,7 +252,8 @@ impl GenerateCommand {
             &previous_schema,
             &schema,
             &rename_hints,
-        ) else {
+        )?
+        else {
             println!(
                 "  {}",
                 style("The current schema matches the previous snapshot. No migration needed.")

@@ -30,6 +30,11 @@ pub enum Fault {
     /// what a real connection-lost error would do and prompting the pool
     /// to evict the connection.
     ConnectionLost,
+
+    /// Causes the next `exec` to return `Error::serialization_failure`
+    /// without touching the underlying connection, like an
+    /// optimistic-concurrency conflict.
+    SerializationFailure,
 }
 
 #[derive(Debug)]
@@ -220,6 +225,11 @@ impl Connection for InstrumentedConnection {
                         "injected connection-lost fault",
                     )));
                 }
+                Fault::SerializationFailure => {
+                    return Err(toasty_core::Error::serialization_failure(
+                        "injected serialization failure",
+                    ));
+                }
             }
         }
 
@@ -287,6 +297,11 @@ impl Connection for InstrumentedConnection {
                     return Err(toasty_core::Error::connection_lost(std::io::Error::other(
                         "injected connection-lost fault",
                     )));
+                }
+                Fault::SerializationFailure => {
+                    return Err(toasty_core::Error::serialization_failure(
+                        "injected serialization failure",
+                    ));
                 }
             }
         }

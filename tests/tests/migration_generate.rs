@@ -27,6 +27,7 @@ fn migration_generate_with_decimal_model_writes_snapshot() {
         &schema.db,
         &Default::default(),
     )
+    .unwrap()
     .expect("schema differs from empty; expected a migration");
 
     let db::Migration::Sql(sql) = &generated.migration;

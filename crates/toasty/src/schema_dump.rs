@@ -48,6 +48,7 @@ mod dump {
         ("mysql", &Capability::MYSQL),
         ("mariadb", &Capability::MARIADB),
         ("turso", &Capability::TURSO),
+        ("aurora-dsql", &Capability::AURORA_DSQL),
     ];
 
     #[linktime::ctor(unsafe)]

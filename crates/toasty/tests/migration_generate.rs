@@ -54,7 +54,7 @@ fn generate_returns_none_for_empty_diff() {
     let schema = users_schema();
     let hints = diff::RenameHints::new();
 
-    let generated = migration::generate(&Capability::SQLITE, &schema, &schema, &hints);
+    let generated = migration::generate(&Capability::SQLITE, &schema, &schema, &hints).unwrap();
 
     assert!(generated.is_none());
 }
@@ -65,12 +65,26 @@ fn generate_returns_migration_and_next_snapshot() {
     let next = users_schema();
     let hints = diff::RenameHints::new();
 
-    let generated = migration::generate(&Capability::SQLITE, &previous, &next, &hints).unwrap();
+    let generated = migration::generate(&Capability::SQLITE, &previous, &next, &hints)
+        .unwrap()
+        .unwrap();
 
     assert_eq!(generated.snapshot.schema.tables[0].name, "users");
     let db::Migration::Sql(sql) = generated.migration;
     assert!(sql.contains("CREATE TABLE"));
     assert!(sql.contains("users"));
+}
+
+#[test]
+fn generate_returns_validation_error() {
+    let previous = users_schema();
+    let mut next = users_schema();
+    next.tables[0].columns[0].storage_ty = db::Type::Text;
+    let hints = diff::RenameHints::new();
+
+    let err = migration::generate(&Capability::AURORA_DSQL, &previous, &next, &hints).unwrap_err();
+
+    assert!(err.is_unsupported_feature(), "{err}");
 }
 
 #[test]

@@ -11,6 +11,7 @@
 //! let driver = PostgreSQL::new("postgresql://localhost/mydb").unwrap();
 //! ```
 
+mod dsql;
 mod oid_cache;
 mod statement_cache;
 #[cfg(feature = "tls")]
@@ -21,13 +22,13 @@ mod value;
 pub(crate) use value::Value;
 
 use async_trait::async_trait;
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, future::Future, pin::Pin, sync::Arc, time::Duration};
 use toasty_core::{
     Result, Schema,
     driver::{
         Capability, ConnectContext, ConnectionUrl, Driver, ExecResponse, Operation, QueryLogConfig,
         log::QueryLog,
-        operation::{RawSqlRet, Transaction, TransactionMode, TypedValue},
+        operation::{IsolationLevel, RawSqlRet, Transaction, TransactionMode, TypedValue},
     },
     schema::db::{self, Table},
     stmt,
@@ -66,6 +67,40 @@ fn classify_pg_error(e: tokio_postgres::Error) -> toasty_core::Error {
     }
 }
 
+/// Whether `err` is a server-side error, as classified by
+/// [`classify_pg_error`]. Inside a transaction, such an error leaves the
+/// transaction aborted.
+fn is_server_error(err: &toasty_core::Error) -> bool {
+    err.is_driver_operation_failed()
+        || err.is_serialization_failure()
+        || err.is_read_only_transaction()
+}
+
+/// Aurora DSQL runs every transaction at `REPEATABLE READ` and rejects
+/// `BEGIN ISOLATION LEVEL` with any other level, so a `Start` that names a
+/// level is sent without it. Returns `None` when `t` needs no change.
+fn dsql_transaction_start(t: &Transaction) -> Option<Transaction> {
+    let Transaction::Start {
+        isolation: Some(level),
+        read_only,
+        mode,
+    } = *t
+    else {
+        return None;
+    };
+    if level != IsolationLevel::RepeatableRead {
+        tracing::warn!(
+            "Aurora DSQL supports only REPEATABLE READ; running the transaction at \
+             REPEATABLE READ instead of {level:?}"
+        );
+    }
+    Some(Transaction::Start {
+        isolation: None,
+        read_only,
+        mode,
+    })
+}
+
 /// A PostgreSQL [`Driver`] that connects via `tokio-postgres`.
 ///
 /// # Examples
@@ -80,6 +115,41 @@ pub struct PostgreSQL {
     config: Config,
     #[cfg(feature = "tls")]
     tls: Option<tokio_postgres_rustls::MakeRustlsConnect>,
+    capability: &'static Capability,
+    dsql: Option<DsqlSchemaConfig>,
+    password_provider: Option<PasswordProvider>,
+}
+
+type PasswordFuture =
+    Pin<Box<dyn Future<Output = std::result::Result<String, BoxError>> + Send + 'static>>;
+type PasswordProvider = Arc<dyn Fn() -> PasswordFuture + Send + Sync>;
+type BoxError = Box<dyn std::error::Error + Send + Sync + 'static>;
+
+/// Schema-execution settings for Aurora DSQL, read only by this driver.
+#[derive(Debug, Clone)]
+struct DsqlSchemaConfig {
+    /// `CACHE` value for identity columns: 1 or at least 65,536.
+    identity_cache: u32,
+
+    /// How long to wait for an asynchronous index-build job.
+    job_timeout: Duration,
+
+    /// Retries for a schema step the server rejects with SQLSTATE `40001`.
+    schema_retries: u32,
+    schema_retry_base_delay: Duration,
+    schema_retry_max_delay: Duration,
+}
+
+impl Default for DsqlSchemaConfig {
+    fn default() -> Self {
+        Self {
+            identity_cache: 65_536,
+            job_timeout: Duration::from_secs(5 * 60),
+            schema_retries: 3,
+            schema_retry_base_delay: Duration::from_millis(50),
+            schema_retry_max_delay: Duration::from_secs(5),
+        }
+    }
 }
 
 impl std::fmt::Debug for PostgreSQL {
@@ -89,12 +159,23 @@ impl std::fmt::Debug for PostgreSQL {
             config,
             #[cfg(feature = "tls")]
             tls,
+            capability,
+            dsql,
+            password_provider,
         } = self;
+        let url = ConnectionUrl::parse(url)
+            .map_or(Cow::Borrowed(url.as_str()), |url| url.redact_password());
         let mut s = f.debug_struct("PostgreSQL");
-        s.field("url", url);
+        s.field("url", &url);
         s.field("config", config);
         #[cfg(feature = "tls")]
         s.field("tls", &tls.as_ref().map(|_| "MakeRustlsConnect"));
+        s.field("capability", &capability.driver_name);
+        s.field("dsql", dsql);
+        s.field(
+            "password_provider",
+            &password_provider.as_ref().map(|_| "PasswordProvider"),
+        );
         s.finish()
     }
 }
@@ -213,10 +294,121 @@ impl PostgreSQL {
             config,
             #[cfg(feature = "tls")]
             tls,
+            capability: &Capability::POSTGRESQL,
+            dsql: None,
+            password_provider: None,
         })
     }
 
-    async fn connect_with_config(&self, config: Config) -> Result<Connection> {
+    /// Targets Amazon Aurora DSQL.
+    ///
+    /// Selects [`Capability::AURORA_DSQL`] and DSQL's schema rules:
+    /// `push_schema` and migrations run one DDL statement per transaction,
+    /// build indexes with `CREATE INDEX ASYNC` and wait for the build job,
+    /// render identity columns with `CACHE 65536` by default (see
+    /// [`identity_cache`](Self::identity_cache)), and retry a schema step
+    /// the server rejects with SQLSTATE `40001`. Transactions run at
+    /// `REPEATABLE READ` whatever isolation level is requested, with a
+    /// warning when it differs.
+    ///
+    /// Without this call the driver behaves as plain PostgreSQL; the host
+    /// name is never inspected.
+    pub fn aurora_dsql(mut self) -> Self {
+        self.capability = &Capability::AURORA_DSQL;
+        self.dsql.get_or_insert_with(DsqlSchemaConfig::default);
+        self
+    }
+
+    /// Sets the `CACHE` value for identity (auto-increment) columns on
+    /// Aurora DSQL. The default is 65,536.
+    ///
+    /// DSQL accepts 1 or at least 65,536. A large cache gives unique but
+    /// non-consecutive ids across connections; 1 gives dense ids at lower
+    /// insert throughput.
+    ///
+    /// This applies to tables created by `push_schema`. Generated migrations
+    /// always use `CACHE 65536`; edit the migration SQL to change it.
+    ///
+    /// Returns [`Error::invalid_driver_configuration`] for any other value,
+    /// or when [`aurora_dsql`](Self::aurora_dsql) was not called first.
+    ///
+    /// [`Error::invalid_driver_configuration`]: toasty_core::Error::invalid_driver_configuration
+    pub fn identity_cache(mut self, cache: u32) -> Result<Self> {
+        let dsql = self.dsql_config_mut("identity_cache")?;
+        if cache != 1 && cache < 65_536 {
+            return Err(toasty_core::Error::invalid_driver_configuration(format!(
+                "Aurora DSQL identity cache must be 1 or at least 65536, got {cache}"
+            )));
+        }
+        dsql.identity_cache = cache;
+        Ok(self)
+    }
+
+    /// Sets how long `push_schema` and migrations wait for an Aurora DSQL
+    /// index-build job. The default is 5 minutes.
+    ///
+    /// When the wait times out, the operation fails and the job keeps running
+    /// on the server.
+    ///
+    /// Returns [`Error::invalid_driver_configuration`] when
+    /// [`aurora_dsql`](Self::aurora_dsql) was not called first, or when
+    /// `timeout` is zero.
+    ///
+    /// [`Error::invalid_driver_configuration`]: toasty_core::Error::invalid_driver_configuration
+    pub fn schema_job_timeout(mut self, timeout: Duration) -> Result<Self> {
+        let dsql = self.dsql_config_mut("schema_job_timeout")?;
+        if timeout.is_zero() {
+            return Err(toasty_core::Error::invalid_driver_configuration(
+                "Aurora DSQL schema job timeout must be greater than zero",
+            ));
+        }
+        dsql.job_timeout = timeout;
+        Ok(self)
+    }
+
+    /// Sets a function that returns the password for each new connection.
+    ///
+    /// The provider runs once per connection the driver opens: when the pool
+    /// grows or replaces a connection, and for every `reset_db`
+    /// connection. It does not run when a pooled connection is reused. Its
+    /// result overrides any password in the connection URL. Use it for
+    /// short-lived credentials such as Aurora DSQL IAM authentication tokens.
+    ///
+    /// When the provider fails, connecting fails with
+    /// `driver_operation_failed("PostgreSQL password provider failed")`; the
+    /// provider's own error text is not included because it may contain
+    /// secrets.
+    pub fn password_provider<F, Fut, E>(mut self, provider: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = std::result::Result<String, E>> + Send + 'static,
+        E: Into<Box<dyn std::error::Error + Send + Sync>>,
+    {
+        self.password_provider = Some(Arc::new(move || {
+            let fut = provider();
+            Box::pin(async move { fut.await.map_err(Into::into) })
+        }));
+        self
+    }
+
+    fn dsql_config_mut(&mut self, option: &str) -> Result<&mut DsqlSchemaConfig> {
+        self.dsql.as_mut().ok_or_else(|| {
+            toasty_core::Error::invalid_driver_configuration(format!(
+                "`{option}` requires `aurora_dsql()` to be called first"
+            ))
+        })
+    }
+
+    async fn connect_with_config(&self, mut config: Config) -> Result<Connection> {
+        if let Some(provider) = &self.password_provider {
+            // The provider's error may contain a token, so it is dropped.
+            let password = provider().await.map_err(|_| {
+                toasty_core::Error::driver_operation_failed(std::io::Error::other(
+                    "PostgreSQL password provider failed",
+                ))
+            })?;
+            config.password(password);
+        }
         #[cfg(feature = "tls")]
         if let Some(ref tls) = self.tls {
             return Connection::connect(config, tls.clone()).await;
@@ -232,7 +424,7 @@ impl Driver for PostgreSQL {
     }
 
     fn capability(&self) -> &'static Capability {
-        &Capability::POSTGRESQL
+        self.capability
     }
 
     async fn connect(
@@ -241,10 +433,16 @@ impl Driver for PostgreSQL {
     ) -> toasty_core::Result<Box<dyn toasty_core::driver::Connection>> {
         let mut connection = self.connect_with_config(self.config.clone()).await?;
         connection.query_log = cx.query_log;
+        connection.dsql = self.dsql.clone();
         Ok(Box::new(connection))
     }
 
     async fn reset_db(&self) -> toasty_core::Result<()> {
+        // DSQL has a single database and no CREATE/DROP DATABASE.
+        if let Some(config) = &self.dsql {
+            let mut conn = self.connect_with_config(self.config.clone()).await?;
+            return conn.drop_all_tables(config).await;
+        }
         let dbname = self
             .config
             .get_dbname()
@@ -313,6 +511,19 @@ pub struct Connection {
     statement_cache: StatementCache,
     oid_cache: OidCache,
     query_log: QueryLogConfig,
+    /// Set when the server rejects a statement, which aborts the open
+    /// transaction, and cleared when the server accepts one. PostgreSQL
+    /// answers `COMMIT` on an aborted transaction by rolling it back without
+    /// an error, and tokio-postgres does not expose the `ROLLBACK` command
+    /// tag, so the driver tracks the state.
+    aborted: bool,
+    dsql: Option<DsqlSchemaConfig>,
+    /// Set when the connection must not be reused (an abandoned `CALL` is
+    /// still running on it).
+    discard: bool,
+    /// The spawned connection task, aborted to close the socket when the
+    /// connection is discarded.
+    task: Option<tokio::task::AbortHandle>,
 }
 
 impl Connection {
@@ -323,6 +534,10 @@ impl Connection {
             statement_cache: StatementCache::new(100),
             oid_cache: OidCache::new(),
             query_log: QueryLogConfig::default(),
+            aborted: false,
+            dsql: None,
+            discard: false,
+            task: None,
         }
     }
 
@@ -336,13 +551,16 @@ impl Connection {
     {
         let (client, connection) = config.connect(tls).await.map_err(classify_pg_error)?;
 
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             if let Err(e) = connection.await {
                 eprintln!("connection error: {e}");
             }
         });
 
-        Ok(Self::new(client))
+        Ok(Self {
+            task: Some(task.abort_handle()),
+            ..Self::new(client)
+        })
     }
 
     async fn exec_sql(
@@ -360,8 +578,26 @@ impl Connection {
         let result = self
             .exec_sql_inner(sql_as_str, typed_params, ret, &mut log)
             .await;
+        self.track_aborted(&result);
+        // A schema change by another session can leave cached plans stale.
+        if self.dsql.is_some() && matches!(&result, Err(err) if err.is_serialization_failure()) {
+            self.statement_cache.clear();
+        }
         log.finish(&result);
         result
+    }
+
+    /// Updates `aborted` from the server's answer to a statement. In an
+    /// aborted transaction PostgreSQL rejects every command except those that
+    /// end the transaction or roll back to a savepoint, so a success means
+    /// the transaction is not aborted. A client-side error never reached the
+    /// server and leaves the state unchanged.
+    fn track_aborted<T>(&mut self, result: &Result<T>) {
+        match result {
+            Ok(_) => self.aborted = false,
+            Err(err) if is_server_error(err) => self.aborted = true,
+            Err(_) => {}
+        }
     }
 
     async fn exec_sql_inner(
@@ -371,6 +607,18 @@ impl Connection {
         ret: SqlReturn,
         log: &mut QueryLog<'_>,
     ) -> Result<ExecResponse> {
+        let typed_params = if self.dsql.is_some() {
+            typed_params
+                .into_iter()
+                .map(|tv| TypedValue {
+                    ty: dsql::enum_as_text(tv.ty),
+                    value: tv.value,
+                })
+                .collect()
+        } else {
+            typed_params
+        };
+
         self.oid_cache
             .preload(&self.client, typed_params.iter().map(|tv| &tv.ty))
             .await?;
@@ -440,6 +688,22 @@ impl Connection {
     pub async fn create_table(&mut self, schema: &db::Schema, table: &Table) -> Result<()> {
         let serializer = sql::Serializer::postgresql(schema);
 
+        if let Some(config) = self.dsql.clone() {
+            let options = config.ddl_options();
+            let sql = serializer.serialize(&sql::Statement::create_table_with(
+                table,
+                &Capability::AURORA_DSQL,
+                &options,
+            ));
+            self.exec_ddl(&config, &sql).await?;
+
+            for index in table.indices.iter().filter(|index| !index.primary_key) {
+                let sql = serializer.serialize(&sql::Statement::create_index_with(index, &options));
+                self.exec_ddl(&config, &sql).await?;
+            }
+            return Ok(());
+        }
+
         let sql = serializer.serialize(&sql::Statement::create_table(
             table,
             &Capability::POSTGRESQL,
@@ -491,11 +755,24 @@ impl toasty_core::driver::Connection for Connection {
                     "PostgreSQL does not support TransactionMode::{mode:?}"
                 )));
             }
+            let dsql_start = self.dsql.as_ref().and_then(|_| dsql_transaction_start(t));
+            let t = dsql_start.as_ref().unwrap_or(t);
             let sql = sql::Serializer::postgresql(&schema.db).serialize_transaction(t);
-            self.client
+            let commit_after_abort = matches!(t, Transaction::Commit) && self.aborted;
+            let result = self
+                .client
                 .batch_execute(&sql)
                 .await
-                .map_err(classify_pg_error)?;
+                .map_err(classify_pg_error);
+            self.track_aborted(&result);
+            result?;
+            if commit_after_abort {
+                return Err(toasty_core::Error::driver_operation_failed(
+                    std::io::Error::other(
+                        "transaction was aborted by an earlier error and has been rolled back",
+                    ),
+                ));
+            }
             return Ok(ExecResponse::count(0));
         }
 
@@ -527,6 +804,10 @@ impl toasty_core::driver::Connection for Connection {
     }
 
     async fn push_schema(&mut self, schema: &Schema) -> Result<()> {
+        // DSQL has no enum types; enums are TEXT columns with a CHECK.
+        if self.dsql.is_some() {
+            return self.push_dsql_schema(&schema.db).await;
+        }
         let serializer = sql::Serializer::postgresql(&schema.db);
 
         // Create PostgreSQL enum types before creating tables.
@@ -558,6 +839,9 @@ impl toasty_core::driver::Connection for Connection {
     async fn applied_migrations(
         &mut self,
     ) -> Result<Vec<toasty_core::schema::db::AppliedMigration>> {
+        if let Some(config) = self.dsql.clone() {
+            return self.dsql_applied_migrations(&config).await;
+        }
         // Ensure the migrations table exists
         self.client
             .execute(
@@ -597,6 +881,11 @@ impl toasty_core::driver::Connection for Connection {
         migration: &toasty_core::schema::db::Migration,
     ) -> Result<()> {
         tracing::info!(id = id, name = %name, "applying migration");
+        if let Some(config) = self.dsql.clone() {
+            return self
+                .apply_dsql_migration(&config, id, name, migration)
+                .await;
+        }
         // Ensure the migrations table exists
         self.client
             .execute(
@@ -644,7 +933,7 @@ impl toasty_core::driver::Connection for Connection {
     }
 
     fn is_valid(&self) -> bool {
-        !self.client.is_closed()
+        !self.discard && !self.client.is_closed()
     }
 
     async fn ping(&mut self) -> Result<()> {
@@ -746,6 +1035,56 @@ mod tests {
         assert_eq!(c.get_options(), Some("-c search_path=tenant_a,public"));
     }
 
+    /// A server error from a savepoint command aborts the transaction, so
+    /// committing it returns an error and nothing persists.
+    #[tokio::test]
+    async fn commit_after_failed_savepoint_command_errors() {
+        use toasty_core::driver::{Connection as _, Rows, operation::RawSql};
+
+        let Ok(url) = std::env::var("TOASTY_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let mut conn = Connection::connect(cfg(&url), tokio_postgres::NoTls)
+            .await
+            .unwrap();
+        let app = toasty_core::schema::app::Schema::from_macro([]).unwrap();
+        let schema = Arc::new(
+            toasty_core::schema::Builder::new()
+                .build(app, &Capability::POSTGRESQL)
+                .unwrap(),
+        );
+        let raw = |sql: &str| {
+            Operation::from(RawSql {
+                sql: sql.to_string(),
+                params: vec![],
+                ret: RawSqlRet::None,
+            })
+        };
+
+        conn.exec(&schema, raw("CREATE TEMP TABLE release_failure (id int)"))
+            .await
+            .unwrap();
+        conn.exec(&schema, Transaction::start().into())
+            .await
+            .unwrap();
+        conn.exec(&schema, raw("INSERT INTO release_failure VALUES (1)"))
+            .await
+            .unwrap();
+        let release = Transaction::ReleaseSavepoint("does_not_exist".to_string());
+        assert!(conn.exec(&schema, release.into()).await.is_err());
+        let err = conn
+            .exec(&schema, Transaction::Commit.into())
+            .await
+            .unwrap_err();
+        assert!(err.is_driver_operation_failed(), "{err}");
+
+        let deleted = conn
+            .exec(&schema, raw("DELETE FROM release_failure"))
+            .await
+            .unwrap();
+        assert!(matches!(deleted.values, Rows::Count(0)));
+    }
+
     #[test]
     fn missing_host_rejected() {
         let err = PostgreSQL::new("postgresql:///mydb").unwrap_err();
@@ -762,5 +1101,98 @@ mod tests {
             err.to_string().contains("invalid port"),
             "expected invalid-port error, got: {err}"
         );
+    }
+
+    #[test]
+    fn dsql_transaction_start_drops_isolation_level() {
+        use IsolationLevel::*;
+
+        for level in [ReadUncommitted, ReadCommitted, RepeatableRead, Serializable] {
+            for read_only in [false, true] {
+                let t = Transaction::Start {
+                    isolation: Some(level),
+                    read_only,
+                    mode: TransactionMode::Default,
+                };
+                let start = dsql_transaction_start(&t);
+                assert!(
+                    matches!(
+                        start,
+                        Some(Transaction::Start {
+                            isolation: None,
+                            read_only: r,
+                            mode: TransactionMode::Default,
+                        }) if r == read_only
+                    ),
+                    "{level:?}, read_only = {read_only}: {start:?}"
+                );
+            }
+        }
+
+        assert!(dsql_transaction_start(&Transaction::start()).is_none());
+        assert!(dsql_transaction_start(&Transaction::Commit).is_none());
+    }
+
+    #[test]
+    fn aurora_dsql_selects_dsql_capability() {
+        let pg = PostgreSQL::new("postgresql://localhost/mydb").unwrap();
+        assert_eq!(pg.capability().driver_name, "PostgreSQL");
+        assert!(pg.capability().savepoints);
+
+        let dsql = pg.aurora_dsql();
+        assert_eq!(dsql.capability().driver_name, "Aurora DSQL");
+        assert!(!dsql.capability().savepoints);
+    }
+
+    #[test]
+    fn dsql_options_validated() {
+        let pg = || PostgreSQL::new("postgresql://localhost/mydb").unwrap();
+
+        assert!(pg().aurora_dsql().identity_cache(1).is_ok());
+        let dsql = pg().aurora_dsql().identity_cache(1).unwrap().dsql.unwrap();
+        assert_eq!(dsql.identity_cache, 1);
+        assert!(pg().aurora_dsql().identity_cache(65_536).is_ok());
+        let err = pg().aurora_dsql().identity_cache(65_535).unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+        let err = pg()
+            .aurora_dsql()
+            .schema_job_timeout(Duration::ZERO)
+            .unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+
+        let err = pg().identity_cache(65_536).unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+        let err = pg()
+            .schema_job_timeout(Duration::from_secs(60))
+            .unwrap_err();
+        assert!(err.is_invalid_driver_configuration(), "{err}");
+    }
+
+    #[test]
+    fn debug_redacts_url_password() {
+        let pg = PostgreSQL::new("postgresql://alice:url-sentinel@localhost/mydb").unwrap();
+        let debug = format!("{pg:?}");
+        assert!(!debug.contains("url-sentinel"), "{debug}");
+    }
+
+    #[tokio::test]
+    async fn password_provider_error_has_fixed_message() {
+        let pg = PostgreSQL::new("postgresql://127.0.0.1:1/mydb")
+            .unwrap()
+            .password_provider(|| async { Err::<String, _>("error-sentinel") });
+        let err = pg.connect(&ConnectContext::default()).await.unwrap_err();
+        assert!(err.is_driver_operation_failed(), "{err}");
+        assert_eq!(err.to_string(), "PostgreSQL password provider failed");
+    }
+
+    #[tokio::test]
+    async fn password_provider_result_not_exposed() {
+        let pg = PostgreSQL::new("postgresql://127.0.0.1:1/mydb")
+            .unwrap()
+            .password_provider(|| async { Ok::<_, std::io::Error>("pw-sentinel".to_string()) });
+        let err = pg.connect(&ConnectContext::default()).await.unwrap_err();
+        for text in [err.to_string(), format!("{pg:?}"), pg.url().into_owned()] {
+            assert!(!text.contains("pw-sentinel"), "{text}");
+        }
     }
 }

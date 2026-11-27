@@ -1,6 +1,6 @@
 use super::apply::apply_migrations;
-use crate::Project;
 use crate::theme::dialoguer_theme;
+use crate::{Flavor, Project};
 use anyhow::Result;
 use clap::Parser;
 use console::style;
@@ -17,6 +17,11 @@ pub struct ResetCommand {
     #[arg(long, env = "DATABASE_URL")]
     url: String,
 
+    /// Database flavor; `aurora-dsql` connects with the Aurora DSQL profile.
+    /// Defaults to `migration.flavor` in Toasty.toml
+    #[arg(long)]
+    flavor: Option<Flavor>,
+
     /// Skip applying migrations after reset
     #[arg(long)]
     skip_migrations: bool,
@@ -32,7 +37,8 @@ impl ResetCommand {
         println!("  {}", style("Reset Database").cyan().bold().underlined());
         println!();
 
-        let db = crate::utility::connect(&self.url).await?;
+        let flavor = self.flavor.or(project.config.migration.flavor);
+        let db = crate::utility::connect(&self.url, flavor).await?;
         println!(
             "  {}",
             style(format!(

@@ -119,6 +119,7 @@ pub mod starts_with;
 pub mod tx_atomic_stmt;
 pub mod tx_interactive;
 pub mod tx_lock_mode;
+pub mod tx_retry;
 pub mod type_bigdecimal;
 pub mod type_collection;
 pub mod type_decimal;

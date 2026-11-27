@@ -52,17 +52,25 @@ struct Exec<'a> {
     connection: &'a mut dyn Connection,
     vars: VarStore,
     /// True when an outer transaction is active on this connection. Used by
-    /// ReadModifyWrite to decide between savepoints (nested) and its own
-    /// BEGIN/COMMIT (standalone).
+    /// ReadModifyWrite to decide between savepoints (nested), running
+    /// directly in it (no savepoints), and its own BEGIN/COMMIT (standalone).
     in_transaction: bool,
+    /// Set when a ReadModifyWrite failed while running directly in the outer
+    /// transaction for lack of savepoints.
+    failed_without_savepoint: bool,
 }
 
 impl Engine {
+    /// Runs `plan`. Sets `tx_failed` when, inside an outer transaction, an
+    /// operation that would have used a savepoint (a multi-statement plan or
+    /// a read-modify-write) fails without one: it may have written, so the
+    /// outer transaction must not commit.
     pub(crate) async fn exec_plan(
         &self,
         connection: &mut dyn Connection,
         plan: ExecPlan,
         in_transaction: bool,
+        tx_failed: &mut bool,
     ) -> Result<ExecResponse> {
         let ExecPlan {
             plan: logical_plan,
@@ -77,6 +85,7 @@ impl Engine {
             connection,
             vars,
             in_transaction,
+            failed_without_savepoint: false,
         };
 
         // When nested inside an outer transaction use savepoints so the outer
@@ -98,6 +107,11 @@ impl Engine {
             )
         };
 
+        // Without savepoints, the steps run directly in the outer transaction.
+        let without_savepoint =
+            needs_transaction && exec.in_transaction && !self.capability.savepoints;
+        let needs_transaction = needs_transaction && !without_savepoint;
+
         if needs_transaction {
             tracing::trace!("beginning plan transaction");
             exec.connection.exec(&self.schema, begin.into()).await?;
@@ -111,6 +125,9 @@ impl Engine {
             // violation should not error-spam production logs.
             if let Err(e) = exec.exec_step(&logical_plan, step).await {
                 tracing::debug!(step = i, action = %step.name(&logical_plan), error = %e, "action failed");
+                if in_transaction && (without_savepoint || exec.failed_without_savepoint) {
+                    *tx_failed = true;
+                }
                 if needs_transaction {
                     tracing::trace!("rolling back plan transaction due to error");
                     // Best effort: ignore rollback errors so the original error is returned

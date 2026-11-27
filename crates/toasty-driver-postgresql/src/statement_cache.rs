@@ -18,6 +18,15 @@ impl StatementCache {
         }
     }
 
+    pub fn clear(&mut self) {
+        self.inner.clear();
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
     pub fn get(&mut self, query: &str, types: &[Type]) -> Option<Statement> {
         self.inner
             .get(&Key::new(query, types).into_owned())

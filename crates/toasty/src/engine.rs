@@ -77,12 +77,14 @@ impl Engine {
     ///
     /// The statement passes through the full compilation pipeline
     /// (lowering -> planning -> execution) before being sent to the database
-    /// driver via the provided connection.
+    /// driver via the provided connection. `tx_failed` is set as described
+    /// in [`exec_plan`](Self::exec_plan).
     pub(crate) async fn exec(
         &self,
         connection: &mut dyn Connection,
         mut stmt: Statement,
         in_transaction: bool,
+        tx_failed: &mut bool,
     ) -> Result<toasty_core::driver::ExecResponse> {
         self.normalize_stmt(&mut stmt)?;
         self.verify(&stmt)?;
@@ -101,7 +103,8 @@ impl Engine {
 
         // The plan is called once (single entry record stream) with no arguments
         // (empty record).
-        self.exec_plan(connection, plan, in_transaction).await
+        self.exec_plan(connection, plan, in_transaction, tx_failed)
+            .await
     }
 
     /// Executes user-authored SQL through the driver SQL path.

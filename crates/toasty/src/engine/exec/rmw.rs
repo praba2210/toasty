@@ -17,6 +17,14 @@ impl Exec<'_> {
     ) -> Result<ExecResponse> {
         assert!(action.inputs.is_empty(), "TODO");
 
+        // Without savepoints, run directly in the outer transaction. A failure
+        // may come after the write, so it fails the outer transaction.
+        if self.in_transaction && !self.engine.capability.savepoints {
+            let rows = self.rmw_exec(action).await;
+            self.failed_without_savepoint |= rows.is_err();
+            return Ok(ExecResponse::from_rows(rows?));
+        }
+
         // When nested inside an outer transaction use savepoints so the outer
         // transaction can still commit or roll back as a whole. When standalone,
         // start our own transaction (MySQL requires an active BEGIN before

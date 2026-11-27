@@ -8,8 +8,12 @@ use toasty_core::{
     },
 };
 
+mod aurora_dsql;
+
 use crate::Serializer;
-use crate::stmt::{AlterColumnChanges, AlterTable, AlterTableAction, DropTable, Name, Statement};
+use crate::stmt::{
+    AlterColumnChanges, AlterTable, AlterTableAction, DdlOptions, DropTable, Name, Statement,
+};
 
 /// Returns `true` if a named enum change is handled at the type level and
 /// should not produce column-level DDL.
@@ -53,6 +57,12 @@ fn is_named_enum_type_only_change(
 /// `capability.sql`. PostgreSQL gets one batch; other dialects get breakpoint
 /// markers so drivers can execute one statement at a time.
 ///
+/// For [`Capability::AURORA_DSQL`] (selected by its `driver_name`), every
+/// statement is its own step, indexes
+/// are built with `CREATE INDEX ASYNC`, and identity columns get
+/// `CACHE 65536`. Call [`validate_migration`] first: this function does not
+/// check that the backend can apply the diff.
+///
 /// # Panics
 ///
 /// Panics if `capability.sql` is `None`.
@@ -61,12 +71,26 @@ pub fn generate_migration(schema_diff: &diff::Schema<'_>, capability: &Capabilit
         .sql
         .expect("cannot generate a SQL migration for a non-SQL capability");
 
-    let statements = MigrationStatement::from_diff(schema_diff, capability);
+    let dsql = aurora_dsql::is_aurora_dsql(capability);
+    let statements = if dsql {
+        MigrationStatement::from_diff_with(
+            schema_diff,
+            &aurora_dsql::MIGRATION_CAPABILITY,
+            &aurora_dsql::DDL_OPTIONS,
+        )
+    } else {
+        MigrationStatement::from_diff(schema_diff, capability)
+    };
 
     let sql_strings: Vec<String> = statements
         .iter()
         .map(|stmt| Serializer::new(dialect, stmt.schema()).serialize(stmt.statement()))
         .collect();
+
+    if dsql {
+        // Aurora DSQL runs one DDL statement per transaction.
+        return Migration::new_sql_with_breakpoints(&sql_strings);
+    }
 
     match dialect {
         Dialect::Postgresql => Migration::new_sql(sql_strings.join("\n")),
@@ -74,6 +98,22 @@ pub fn generate_migration(schema_diff: &diff::Schema<'_>, capability: &Capabilit
             Migration::new_sql_with_breakpoints(&sql_strings)
         }
     }
+}
+
+/// Checks that the backend described by `capability` can apply a schema diff,
+/// before any migration is generated, written, or run.
+///
+/// Returns [`toasty_core::Error::unsupported_feature`] naming the first change
+/// [`Capability::AURORA_DSQL`] cannot apply (for example, a column type
+/// change). Every diff is accepted for the other backends.
+pub fn validate_migration(
+    schema_diff: &diff::Schema<'_>,
+    capability: &Capability,
+) -> toasty_core::Result<()> {
+    if aurora_dsql::is_aurora_dsql(capability) {
+        return aurora_dsql::validate_migration(schema_diff);
+    }
+    Ok(())
 }
 
 /// A migration step pairing a DDL [`Statement`] with the [`Schema`] it applies against.
@@ -99,6 +139,16 @@ impl<'a> MigrationStatement<'a> {
     /// `ALTER COLUMN` support (e.g. SQLite), column type changes trigger a
     /// full table recreation sequence.
     pub fn from_diff(schema_diff: &'a diff::Schema<'a>, capability: &Capability) -> Vec<Self> {
+        Self::from_diff_with(schema_diff, capability, &DdlOptions::default())
+    }
+
+    /// Generates migration statements from a [`diff::Schema`], rendering DDL
+    /// with driver [`DdlOptions`].
+    pub fn from_diff_with(
+        schema_diff: &'a diff::Schema<'a>,
+        capability: &Capability,
+        options: &DdlOptions,
+    ) -> Vec<Self> {
         let mut result = Vec::new();
         let types_diff = schema_diff.types();
         let renamed_types: HashSet<(&str, &str)> = types_diff
@@ -149,7 +199,7 @@ impl<'a> MigrationStatement<'a> {
             match table {
                 diff::Table::Create(table) => {
                     result.push(Self::new(
-                        Statement::create_table(table, capability),
+                        Statement::create_table_with(table, capability, options),
                         Cow::Borrowed(schema_diff.next()),
                     ));
                     for index in &table.indices {
@@ -157,7 +207,7 @@ impl<'a> MigrationStatement<'a> {
                             continue; // PK indices are created as part of CREATE TABLE
                         }
                         result.push(Self::new(
-                            Statement::create_index(index),
+                            Statement::create_index_with(index, options),
                             Cow::Borrowed(schema_diff.next()),
                         ));
                     }
@@ -229,6 +279,7 @@ impl<'a> MigrationStatement<'a> {
                             next,
                             columns,
                             capability,
+                            options,
                         );
                     } else {
                         Self::emit_column_changes(
@@ -237,6 +288,7 @@ impl<'a> MigrationStatement<'a> {
                             previous.id,
                             columns,
                             capability,
+                            options,
                             &renamed_types,
                         );
                     }
@@ -247,13 +299,13 @@ impl<'a> MigrationStatement<'a> {
                         match item {
                             diff::Index::Create(index) => {
                                 result.push(Self::new(
-                                    Statement::create_index(index),
+                                    Statement::create_index_with(index, options),
                                     Cow::Borrowed(schema_diff.next()),
                                 ));
                             }
                             diff::Index::Alter { next, .. } => {
                                 result.push(Self::new(
-                                    Statement::create_index(next),
+                                    Statement::create_index_with(next, options),
                                     Cow::Borrowed(schema_diff.next()),
                                 ));
                             }
@@ -273,6 +325,7 @@ impl<'a> MigrationStatement<'a> {
         next: &Table,
         columns: &[diff::Column<'_>],
         capability: &Capability,
+        options: &DdlOptions,
     ) {
         let current_name = schema.table(previous.id).name.clone();
         let temp_name = format!("_toasty_new_{}", current_name);
@@ -293,7 +346,7 @@ impl<'a> MigrationStatement<'a> {
             s
         };
         result.push(Self::new(
-            Statement::create_table(next, capability),
+            Statement::create_table_with(next, capability, options),
             Cow::Owned(temp_schema),
         ));
 
@@ -368,13 +421,14 @@ impl<'a> MigrationStatement<'a> {
         table: TableId,
         columns: &[diff::Column<'_>],
         capability: &Capability,
+        options: &DdlOptions,
         renamed_types: &HashSet<(&str, &str)>,
     ) {
         for item in columns.iter() {
             match item {
                 diff::Column::Add(column) => {
                     result.push(Self::new(
-                        Statement::add_column(table, column, capability),
+                        Statement::add_column_with(table, column, capability, options),
                         schema.clone(),
                     ));
                 }
@@ -402,7 +456,7 @@ impl<'a> MigrationStatement<'a> {
 
                     for changes in changes {
                         result.push(Self::new(
-                            Statement::alter_column(previous, changes, capability),
+                            Statement::alter_column_with(previous, changes, capability, options),
                             schema.clone(),
                         ));
                     }

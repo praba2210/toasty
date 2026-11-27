@@ -37,6 +37,12 @@ mariadb = [
 ]
 dynamodb = ["toasty/dynamodb", "dep:toasty-driver-dynamodb", "dep:aws-config", "dep:aws-sdk-dynamodb"]
 postgresql = ["toasty/postgresql", "dep:toasty-driver-postgresql", "dep:tokio-postgres"]
+dsql = [
+    "postgresql",
+    "dep:tokio-postgres-rustls",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
+]
 
 [dependencies]
 async-trait.workspace = true
@@ -70,6 +76,9 @@ toasty-driver-dynamodb = { workspace = true, optional = true }
 
 # Database clients used directly by per-driver integration test binaries
 tokio-postgres = { workspace = true, optional = true }
+tokio-postgres-rustls = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+rustls-platform-verifier = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
 aws-config = { workspace = true, optional = true }
 aws-sdk-dynamodb = { workspace = true, optional = true }

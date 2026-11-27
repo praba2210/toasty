@@ -62,7 +62,7 @@ pub async fn network_address_round_trip(test: &mut Test) -> Result<(), BoxError>
     Ok(())
 }
 
-#[driver_test]
+#[driver_test(requires(vec_scalar))]
 pub async fn network_address_collection_round_trip(test: &mut Test) -> Result<(), BoxError> {
     #[derive(Debug, toasty::Model)]
     struct Item {
